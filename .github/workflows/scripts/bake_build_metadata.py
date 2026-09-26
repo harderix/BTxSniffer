@@ -98,12 +98,14 @@ def bake_metadata(repo_root: Path) -> None:
     pyproject_data = tomllib.loads(pyproject_text)
     committed_version = pyproject_data['project']['version']
     if committed_version != release_tag:
-        message = (
-            f'Committed pyproject.toml version {committed_version!r} does not match '
-            f'release tag {release_tag!r}. You must commit the updated version string '
-            'in pyproject.toml before publishing the release.'
+        # BTX: plus besoin de modifier pyproject.toml à la main, la version suit le tag de la release.
+        pyproject_text = pyproject_text.replace(
+            f'version = "{committed_version}"',
+            f'version = "{release_tag}"',
+            1,
         )
-        raise ValueError(message)
+        pyproject_path.write_text(pyproject_text, encoding='utf-8')
+        sys.stdout.write(f'pyproject.toml version {committed_version!r} -> {release_tag!r}\n')
 
     dependencies = pyproject_data['project']['dependencies']
     pyside6_version = extract_pyside6_version(dependencies)
