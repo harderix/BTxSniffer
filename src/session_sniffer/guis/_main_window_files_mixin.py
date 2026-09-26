@@ -49,6 +49,7 @@ from session_sniffer.guis.detections_manager import DetectionsManagerDialog
 from session_sniffer.guis.interface_selection_dialog import InterfaceSelectionDialog
 from session_sniffer.guis.utils import activate_window, set_clipboard_text, show_or_focus_window
 from session_sniffer.settings import Settings
+from session_sniffer import updater
 from session_sniffer.updater import UpdateCheckOutcome, check_for_updates
 
 if TYPE_CHECKING:
@@ -117,6 +118,14 @@ class FilesMixin(QMainWindow):
                 self,
                 TITLE,
                 "Les mises à jour ne sont pas encore configurées.\n\nIndique ton dépôt GitHub dans BTX_GITHUB_REPO (fichier constants/standalone.py) puis recompile.",
+            )
+        elif updater.last_check_found_no_release:
+            QMessageBox.warning(
+                self,
+                TITLE,
+                'Aucune version trouvée sur GitHub.\n\n'
+                'Vérifie que ton dépôt est bien en Public et qu\'il contient au moins une release avec BTXSniffer.exe dans ses Assets '
+                '(la compilation GitHub doit être terminée et verte).',
             )
         elif outcome in (UpdateCheckOutcome.PROCEED, UpdateCheckOutcome.IGNORE):
             QMessageBox.information(

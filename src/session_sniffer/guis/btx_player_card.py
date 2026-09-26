@@ -1,9 +1,12 @@
 """BTXSniffer player card ("Fiche joueur").
 
 Scans every saved session log for one IP address and shows, in a single window:
-how many times you met the player, on how many different days, the total time spent
-together, the first and last encounter, the known usernames, the personal note / tag,
-and the list of the latest encounters.
+- tab "Résumé": how many times you met the player, on how many different days, the total
+  time spent together, the first and last encounter, the note / tag and the latest encounters;
+- tab "Détails de l'IP": the network / lookup information already collected by the sniffer,
+  which can be copied line by line or all at once.
+
+Only one card is open at a time: opening another player replaces the current one.
 """
 
 import json
@@ -14,8 +17,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QGuiApplication, QIcon
+from PySide6.QtCore import QObject, QPoint, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -28,6 +31,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -37,7 +41,52 @@ from session_sniffer.constants.standard import LOCAL_TZ
 from session_sniffer.guis.btx_notes import TAGS, PlayerNotes, add_tag_menu, edit_player_note
 
 MAX_ENCOUNTERS_SHOWN = 50
-_UNRESOLVED = {'', '...', 'N/A'}
+_UNRESOLVED = {'', '...', 'N/A', 'None'}
+
+# (section, [(session-log key, French label)])
+IP_DETAIL_FIELDS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    (
+        'Connexion',
+        (
+            ('IP Address', 'Adresse IP'),
+            ('Hostname', "Nom d'hôte"),
+            ('Ports', 'Ports'),
+            ('First Port', 'Premier port'),
+            ('Last Port', 'Dernier port'),
+        ),
+    ),
+    (
+        'Localisation (approximative)',
+        (
+            ('Continent', 'Continent'),
+            ('Country', 'Pays'),
+            ('Country Code', 'Code pays'),
+            ('Region', 'Région'),
+            ('City', 'Ville'),
+            ('Time Zone', 'Fuseau horaire'),
+            ('Currency', 'Devise'),
+        ),
+    ),
+    (
+        'Fournisseur',
+        (
+            ('ISP', 'FAI'),
+            ('ASN / ISP', 'ASN / FAI'),
+            ('Organization', 'Organisation'),
+            ('AS', 'AS'),
+            ('ASN', 'Nom AS'),
+        ),
+    ),
+    (
+        'Type de connexion',
+        (
+            ('Mobile', 'Réseau mobile'),
+            ('VPN', 'VPN / Proxy'),
+            ('Hosting', 'Hébergeur / serveur'),
+        ),
+    ),
+)
+_DETAIL_KEYS = {key for _section, fields in IP_DETAIL_FIELDS for key, _label in fields}
 
 
 @dataclass
@@ -57,9 +106,19 @@ class PlayerCardData:
     ip: str
     encounters: list[Encounter] = field(default_factory=list)
     usernames: list[str] = field(default_factory=list)
-    country: str = ''
-    city: str = ''
-    isp: str = ''
+    details: dict[str, object] = field(default_factory=dict)
+
+    @property
+    def country(self) -> str:
+        return _text(self.details.get('Country'))
+
+    @property
+    def city(self) -> str:
+        return _text(self.details.get('City'))
+
+    @property
+    def isp(self) -> str:
+        return _text(self.details.get('ASN / ISP')) or _text(self.details.get('ISP'))
 
     @property
     def total_seconds(self) -> float:
@@ -76,6 +135,30 @@ class PlayerCardData:
     @property
     def last_seen(self) -> datetime | None:
         return max(((e.end or e.start) for e in self.encounters), default=None)
+
+
+def _text(value: object) -> str:
+    if value is None or isinstance(value, bool):
+        return ''
+    text = str(value).strip()
+    return '' if text in _UNRESOLVED else text
+
+
+def _is_resolved(value: object) -> bool:
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, (list, tuple)):
+        return bool(value)
+    return bool(_text(value))
+
+
+def format_detail_value(value: object) -> str:
+    """Format a lookup value for display ('Oui'/'Non' for booleans, lists joined)."""
+    if isinstance(value, bool):
+        return 'Oui' if value else 'Non'
+    if isinstance(value, (list, tuple)):
+        return ', '.join(str(v) for v in value)
+    return _text(value)
 
 
 def _parse_dt(raw: object) -> datetime | None:
@@ -101,8 +184,7 @@ def _str_list(raw: object) -> list[str]:
 def collect_player_card(ip: str, folder: Path = SESSIONS_LOGGING_DIR_PATH) -> PlayerCardData:
     """Scan every JSON session log under *folder* and gather the history of *ip*."""
     card = PlayerCardData(ip=ip)
-    latest_meta: datetime | None = None
-    seen_names: dict[str, None] = {}
+    infos: list[tuple[datetime, dict]] = []
 
     for json_file in folder.rglob('*.json'):
         info = None
@@ -124,29 +206,23 @@ def collect_player_card(ip: str, folder: Path = SESSIONS_LOGGING_DIR_PATH) -> Pl
         seconds = _parse_seconds(info.get('T. Session Time'))
         if not seconds and end is not None:
             seconds = max(0.0, (end - start).total_seconds())
-        names = _str_list(info.get('Usernames'))
-        card.encounters.append(Encounter(start=start, end=end, seconds=seconds, usernames=names))
+        card.encounters.append(Encounter(start=start, end=end, seconds=seconds, usernames=_str_list(info.get('Usernames'))))
+        infos.append((start, info))
 
-        for name in names:
-            seen_names.setdefault(name, None)
-
-        # keep lookup info from the most recent session that has it
-        if latest_meta is None or start >= latest_meta:
-            latest_meta = start
-            for attr, keys in (('country', ('Country',)), ('city', ('City',)), ('isp', ('ASN / ISP', 'ISP'))):
-                for key in keys:
-                    value = info.get(key)
-                    if isinstance(value, str) and value not in _UNRESOLVED:
-                        setattr(card, attr, value)
-                        break
+    # lookup details: oldest first, so the most recent resolved value wins
+    for _start, info in sorted(infos, key=lambda pair: pair[0]):
+        for key in _DETAIL_KEYS:
+            value = info.get(key)
+            if _is_resolved(value):
+                card.details[key] = value
+    card.details.setdefault('IP Address', ip)
 
     card.encounters.sort(key=lambda e: e.start, reverse=True)
-    # most recent usernames first
     recent_first: dict[str, None] = {}
     for encounter in card.encounters:
         for name in encounter.usernames:
             recent_first.setdefault(name, None)
-    card.usernames = list(recent_first) or list(seen_names)
+    card.usernames = list(recent_first)
     return card
 
 
@@ -201,6 +277,19 @@ def format_relative(value: datetime | None) -> str:
     return f'il y a {years} an{"s" if years > 1 else ""}'
 
 
+def ip_details_text(ip: str, names: list[str], details: dict[str, object]) -> str:
+    """Plain-text version of the 'Détails de l'IP' tab (for the clipboard)."""
+    lines = [f'Détails de l\'IP {ip} — {", ".join(names) or "pseudo inconnu"}']
+    for section, fields in IP_DETAIL_FIELDS:
+        rows = [(label, format_detail_value(details.get(key))) for key, label in fields]
+        rows = [(label, value) for label, value in rows if value]
+        if rows:
+            lines.append('')
+            lines.append(f'[{section}]')
+            lines += [f'{label} : {value}' for label, value in rows]
+    return '\n'.join(lines)
+
+
 # ---------- dialog ----------
 
 
@@ -235,32 +324,38 @@ class _StatTile(QFrame):
         self.sub.setVisible(bool(sub))
 
 
+def _readonly_table(columns: list[str], parent: QWidget) -> QTableWidget:
+    table = QTableWidget(0, len(columns), parent)
+    table.setHorizontalHeaderLabels(columns)
+    table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    table.setWordWrap(False)
+    v_header = table.verticalHeader()
+    if v_header:
+        v_header.setVisible(False)
+    return table
+
+
 class PlayerCardDialog(QDialog):
-    """Window showing the full history of one player."""
+    """Window showing the full history of one player (only one open at a time)."""
 
-    _open: dict[str, 'PlayerCardDialog'] = {}
+    _instance: 'PlayerCardDialog | None' = None
 
-    def __init__(
-        self,
-        ip: str,
-        names: list[str] | None = None,
-        parent: QWidget | None = None,
-        on_changed: Callable[[], object] | None = None,
-    ) -> None:
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._ip = ip
-        self._names = list(names or [])
-        self._on_changed = on_changed
+        self._ip = ''
+        self._names: list[str] = []
+        self._on_changed: Callable[[], object] | None = None
+        self._data: PlayerCardData | None = None
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, on=False)
         self.setWindowIcon(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'player.svg')))
-        self.setWindowTitle(f'Fiche joueur — {", ".join(self._names) or ip}')
-        self.resize(620, 640)
+        self.resize(640, 680)
 
         root = QVBoxLayout(self)
         root.setSpacing(10)
 
-        # header: name + tag + ip
+        # header: name + tag + ip (common to both tabs)
         self._title = QLabel()
         self._title.setTextFormat(Qt.TextFormat.RichText)
         self._title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -271,45 +366,10 @@ class PlayerCardDialog(QDialog):
         self._subtitle.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         root.addWidget(self._subtitle)
 
-        # stat tiles
-        grid = QGridLayout()
-        grid.setSpacing(8)
-        self._tile_count = _StatTile('Croisé')
-        self._tile_days = _StatTile('Jours différents')
-        self._tile_total = _StatTile('Temps total ensemble')
-        self._tile_avg = _StatTile('Moyenne par session')
-        self._tile_first = _StatTile('Première rencontre')
-        self._tile_last = _StatTile('Dernière rencontre')
-        for i, tile in enumerate((self._tile_count, self._tile_days, self._tile_total, self._tile_avg, self._tile_first, self._tile_last)):
-            grid.addWidget(tile, i // 3, i % 3)
-        root.addLayout(grid)
-
-        # note
-        self._note = QLabel()
-        self._note.setWordWrap(True)
-        self._note.setTextFormat(Qt.TextFormat.PlainText)
-        self._note.setStyleSheet('padding: 8px; border: 1px dashed rgba(63, 240, 255, 0.45); border-radius: 6px;')
-        root.addWidget(self._note)
-
-        # encounters table
-        encounters_label = QLabel('Dernières rencontres')
-        encounters_label.setStyleSheet('font-weight: 600;')
-        root.addWidget(encounters_label)
-        self._table = QTableWidget(0, 3, self)
-        self._table.setHorizontalHeaderLabels(['Date', 'Durée', 'Pseudo'])
-        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setAlternatingRowColors(True)
-        self._table.setWordWrap(False)
-        v_header = self._table.verticalHeader()
-        if v_header:
-            v_header.setVisible(False)
-        h_header = self._table.horizontalHeader()
-        if h_header:
-            h_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-            h_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-            h_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        root.addWidget(self._table, 1)
+        self._tabs = QTabWidget(self)
+        root.addWidget(self._tabs, 1)
+        self._tabs.addTab(self._build_summary_tab(), QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'player.svg')), 'Résumé')
+        self._tabs.addTab(self._build_details_tab(), QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'globe.svg')), "Détails de l'IP")
 
         # buttons
         buttons = QHBoxLayout()
@@ -317,7 +377,9 @@ class PlayerCardDialog(QDialog):
         copy_menu = QMenu(copy_btn)
         copy_menu.addAction("Copier l'IP", lambda: QGuiApplication.clipboard().setText(self._ip))
         copy_menu.addAction('Copier le pseudo', lambda: QGuiApplication.clipboard().setText(', '.join(self._names)))
-        copy_menu.addAction('Copier la fiche', self._copy_summary)
+        copy_menu.addSeparator()
+        copy_menu.addAction('Copier la fiche (résumé)', self._copy_summary)
+        copy_menu.addAction("Copier les détails de l'IP", self._copy_details)
         copy_btn.setMenu(copy_menu)
         note_btn = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'edit.svg')), 'Note…')
         note_btn.clicked.connect(self._edit_note)
@@ -333,11 +395,74 @@ class PlayerCardDialog(QDialog):
         buttons.addWidget(close_btn)
         root.addLayout(buttons)
 
-        self._data: PlayerCardData | None = None
         self._loader = _Loader(self)
         self._loader.loaded.connect(self._apply)
-        self._render_header()
-        self._load()
+
+    # ----- tabs -----
+
+    def _build_summary_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(10)
+
+        grid = QGridLayout()
+        grid.setSpacing(8)
+        self._tile_count = _StatTile('Croisé')
+        self._tile_days = _StatTile('Jours différents')
+        self._tile_total = _StatTile('Temps total ensemble')
+        self._tile_avg = _StatTile('Moyenne par session')
+        self._tile_first = _StatTile('Première rencontre')
+        self._tile_last = _StatTile('Dernière rencontre')
+        self._tiles = (self._tile_count, self._tile_days, self._tile_total, self._tile_avg, self._tile_first, self._tile_last)
+        for i, tile in enumerate(self._tiles):
+            grid.addWidget(tile, i // 3, i % 3)
+        layout.addLayout(grid)
+
+        self._note = QLabel()
+        self._note.setWordWrap(True)
+        self._note.setTextFormat(Qt.TextFormat.PlainText)
+        self._note.setStyleSheet('padding: 8px; border: 1px dashed rgba(63, 240, 255, 0.45); border-radius: 6px;')
+        layout.addWidget(self._note)
+
+        encounters_label = QLabel('Dernières rencontres')
+        encounters_label.setStyleSheet('font-weight: 600;')
+        layout.addWidget(encounters_label)
+        self._table = _readonly_table(['Date', 'Durée', 'Pseudo'], page)
+        self._table.setAlternatingRowColors(True)
+        h_header = self._table.horizontalHeader()
+        if h_header:
+            h_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            h_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            h_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self._table, 1)
+        return page
+
+    def _build_details_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(8)
+
+        self._details = _readonly_table(['Info', 'Valeur'], page)
+        self._details.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._details.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._details.customContextMenuRequested.connect(self._details_menu)
+        self._details.doubleClicked.connect(lambda index: self._copy_detail_row(index.row()))
+        h_header = self._details.horizontalHeader()
+        if h_header:
+            h_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            h_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self._details, 1)
+
+        bottom = QHBoxLayout()
+        hint = QLabel('Double-clic ou clic droit pour copier une ligne. Infos récupérées par BTXSniffer pendant tes sessions.')
+        hint.setWordWrap(True)
+        hint.setStyleSheet('color: #b9a3c9; font-size: 11px;')
+        copy_all = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), 'Tout copier')
+        copy_all.clicked.connect(self._copy_details)
+        bottom.addWidget(hint, 1)
+        bottom.addWidget(copy_all)
+        layout.addLayout(bottom)
+        return page
 
     # ----- public -----
 
@@ -349,25 +474,46 @@ class PlayerCardDialog(QDialog):
         parent: QWidget | None = None,
         on_changed: Callable[[], object] | None = None,
     ) -> 'PlayerCardDialog':
-        """Open (or bring to front) the card of *ip*."""
-        existing = cls._open.get(ip)
-        if existing is not None:
-            with suppress(RuntimeError):
-                existing.showNormal()
-                existing.raise_()
-                existing.activateWindow()
-                existing._load()  # noqa: SLF001
-                return existing
-        dialog = cls(ip, names, parent, on_changed)
-        cls._open[ip] = dialog
-        dialog.destroyed.connect(lambda _obj=None, key=ip: cls._open.pop(key, None))
+        """Show the card of *ip*, replacing the player shown in the already-open card if any."""
+        dialog = cls._instance
+        if dialog is not None:
+            try:
+                dialog.isVisible()
+            except RuntimeError:  # underlying C++ object already deleted
+                dialog = None
+        if dialog is None:
+            dialog = cls(parent)
+            cls._instance = dialog
+            dialog.destroyed.connect(cls._forget)
+        dialog.set_player(ip, names, on_changed)
+        if dialog.isMinimized():
+            dialog.showNormal()
         dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
         return dialog
+
+    @classmethod
+    def _forget(cls, *_args: object) -> None:
+        cls._instance = None
+
+    def set_player(self, ip: str, names: list[str] | None = None, on_changed: Callable[[], object] | None = None) -> None:
+        """Switch the card to another player."""
+        self._ip = ip
+        self._names = list(names or [])
+        self._on_changed = on_changed
+        self._data = None
+        self._tabs.setCurrentIndex(0)
+        self.setWindowTitle(f'Fiche joueur — {", ".join(self._names) or ip}')
+        self._table.setRowCount(0)
+        self._details.setRowCount(0)
+        self._render_header()
+        self._load()
 
     # ----- loading -----
 
     def _load(self) -> None:
-        for tile in (self._tile_count, self._tile_days, self._tile_total, self._tile_avg, self._tile_first, self._tile_last):
+        for tile in self._tiles:
             tile.set('…')
         loader = self._loader
         ip = self._ip
@@ -383,8 +529,8 @@ class PlayerCardDialog(QDialog):
         threading.Thread(target=work, name='BTXPlayerCard', daemon=True).start()
 
     def _apply(self, data: object) -> None:
-        if not isinstance(data, PlayerCardData):
-            return
+        if not isinstance(data, PlayerCardData) or data.ip != self._ip:
+            return  # result of a player that was replaced in the meantime
         self._data = data
         if data.usernames:
             self._names = data.usernames
@@ -411,12 +557,83 @@ class PlayerCardDialog(QDialog):
             self._table.setItem(row, 2, names_item)
         if not data.encounters:
             self._table.insertRow(0)
-            empty = QTableWidgetItem('Aucune rencontre enregistrée pour ce joueur.')
-            self._table.setItem(0, 0, empty)
+            self._table.setItem(0, 0, QTableWidgetItem('Aucune rencontre enregistrée pour ce joueur.'))
             self._table.setSpan(0, 0, 1, 3)
         self._table.clearSelection()
         self._table.setCurrentCell(-1, -1)
+
+        self._fill_details(data.details)
         self._render_header()
+
+    def _fill_details(self, details: dict[str, object]) -> None:
+        table = self._details
+        table.clearSpans()
+        table.setRowCount(0)
+        section_font = QFont(table.font())
+        section_font.setBold(True)
+        for section, fields in IP_DETAIL_FIELDS:
+            rows = [(label, format_detail_value(details.get(key))) for key, label in fields]
+            rows = [(label, value) for label, value in rows if value]
+            if not rows:
+                continue
+            header_row = table.rowCount()
+            table.insertRow(header_row)
+            header = QTableWidgetItem(section)
+            header.setFont(section_font)
+            header.setForeground(QColor('#ff2bd6'))
+            header.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            header.setData(Qt.ItemDataRole.UserRole, 'section')
+            table.setItem(header_row, 0, header)
+            table.setSpan(header_row, 0, 1, 2)
+            for label, value in rows:
+                row = table.rowCount()
+                table.insertRow(row)
+                label_item = QTableWidgetItem(label)
+                label_item.setForeground(QColor('#b9a3c9'))
+                value_item = QTableWidgetItem(value)
+                value_item.setToolTip(value)
+                table.setItem(row, 0, label_item)
+                table.setItem(row, 1, value_item)
+        if table.rowCount() == 0:
+            table.insertRow(0)
+            table.setItem(0, 0, QTableWidgetItem("Pas encore d'infos pour cette IP."))
+            table.setSpan(0, 0, 1, 2)
+
+    # ----- details copy -----
+
+    def _detail_row(self, row: int) -> tuple[str, str] | None:
+        label = self._details.item(row, 0)
+        value = self._details.item(row, 1)
+        if label is None or value is None or label.data(Qt.ItemDataRole.UserRole) == 'section':
+            return None
+        return label.text(), value.text()
+
+    def _copy_detail_row(self, row: int) -> None:
+        pair = self._detail_row(row)
+        if pair is not None:
+            QGuiApplication.clipboard().setText(pair[1])
+
+    def _details_menu(self, pos: QPoint) -> None:
+        index = self._details.indexAt(pos)
+        rows = sorted({i.row() for i in self._details.selectedIndexes()} | ({index.row()} if index.isValid() else set()))
+        pairs = [pair for row in rows if (pair := self._detail_row(row)) is not None]
+        menu = QMenu(self)
+        if index.isValid() and (pair := self._detail_row(index.row())) is not None:
+            menu.addAction(f'Copier la valeur  ({pair[1][:40]})', lambda: QGuiApplication.clipboard().setText(pair[1]))
+            menu.addAction('Copier la ligne', lambda: QGuiApplication.clipboard().setText(f'{pair[0]} : {pair[1]}'))
+        if len(pairs) > 1:
+            menu.addAction(
+                f'Copier les {len(pairs)} lignes sélectionnées',
+                lambda: QGuiApplication.clipboard().setText('\n'.join(f'{a} : {b}' for a, b in pairs)),
+            )
+        if menu.actions():
+            menu.addSeparator()
+        menu.addAction('Tout copier', self._copy_details)
+        menu.exec(self._details.viewport().mapToGlobal(pos))
+
+    def _copy_details(self) -> None:
+        details = self._data.details if self._data is not None else {'IP Address': self._ip}
+        QGuiApplication.clipboard().setText(ip_details_text(self._ip, self._names, details))
 
     # ----- header / note / tag -----
 

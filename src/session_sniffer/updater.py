@@ -39,6 +39,10 @@ logger = logging.getLogger(__name__)
 
 BTX_EXE_ASSET_NAME = 'BTXSniffer.exe'
 
+# BTX: True when the last check could not find any usable release on GitHub
+# (private repository, no release yet, or no BTXSniffer.exe attached).
+last_check_found_no_release: bool = False
+
 
 class UpdateCheckOutcome(Enum):
     """Outcome of the update check process."""
@@ -59,7 +63,9 @@ def check_for_updates(*, updater_channel: str | None) -> tuple[UpdateCheckOutcom
     if not BTX_UPDATES_CONFIGURED:
         return (UpdateCheckOutcome.IGNORE, None)
 
+    global last_check_found_no_release  # noqa: PLW0603
     outcome, versions = _fetch_versions_with_retries()
+    last_check_found_no_release = outcome is UpdateCheckOutcome.PROCEED and versions is None
     if outcome is UpdateCheckOutcome.PROCEED and versions is not None:
         return _handle_update_decision(updater_channel=updater_channel, versions=versions)
     if outcome is UpdateCheckOutcome.ABORT:
