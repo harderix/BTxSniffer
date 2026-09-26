@@ -1,0 +1,11 @@
+[flake8]
+max-line-length = 176
+extend-ignore =
+    F821,
+    E203,
+    W503
+extend-exclude =
+    .history,
+    .venv
+per-file-ignores =
+    src/session_sniffer/guis/tables.py:E301,E303

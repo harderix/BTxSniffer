@@ -1,0 +1,855 @@
+"""Session status bar and collapsible session table section widgets."""
+
+from typing import TYPE_CHECKING, cast, override
+
+from PySide6.QtCore import QEvent, QObject, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QIcon, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtWidgets import (
+    QComboBox,
+    QFrame,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QSpinBox,
+    QStatusBar,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from session_sniffer.constants.local import RESOURCES_DIR_PATH
+from session_sniffer.constants.standalone import SEARCHABLE_COLUMN_EXCLUSIONS
+from session_sniffer.guis.stylesheets import (
+    CONNECTED_EXPAND_BUTTON_STYLESHEET,
+    DISCONNECTED_EXPAND_BUTTON_STYLESHEET,
+    SECTION_CLEAR_BUTTON_STYLESHEET,
+    SECTION_HEADER_SEPARATOR_STYLESHEET,
+    STATUS_BAR_CAPTURE_LABEL_STYLESHEET,
+    STATUS_BAR_CONFIG_LABEL_STYLESHEET,
+    STATUS_BAR_ISSUES_LABEL_STYLESHEET,
+    STATUS_BAR_PERFORMANCE_LABEL_STYLESHEET,
+    STATUS_BAR_STYLESHEET,
+    section_bar_qss,
+)
+from session_sniffer.guis.table_model import SessionTableModel
+from session_sniffer.guis.tables import SessionTableView
+from session_sniffer.guis.utils import SearchHighlightDelegate, apply_search_icon, make_padded_icon, scale_by_ui
+from session_sniffer.rendering_core.types import PaginationState, SearchState
+from session_sniffer.settings import Settings
+from session_sniffer.guis.i18n import tr
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+_PLAYER_ICON_PATH = (RESOURCES_DIR_PATH / 'icons' / 'player.svg').as_posix()
+
+
+def _svg_file_to_pixmap(svg_path: str, size: int) -> QPixmap:
+    renderer = QSvgRenderer(svg_path)
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    try:
+        renderer.render(painter, QRectF(0, 0, size, size))
+    finally:
+        painter.end()
+    return pixmap
+
+
+class SessionStatusBar(QStatusBar):
+    """Status bar with dedicated labels for capture, config, issues, and performance info."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """Create the status bar and add the four section labels."""
+        super().__init__(parent)
+        self.setSizeGripEnabled(False)
+        self.setStyleSheet(STATUS_BAR_STYLESHEET)
+
+        self._capture_label = QLabel()
+        self._capture_label.setTextFormat(Qt.TextFormat.RichText)
+        self._capture_label.setStyleSheet(STATUS_BAR_CAPTURE_LABEL_STYLESHEET)
+
+        self._config_label = QLabel()
+        self._config_label.setTextFormat(Qt.TextFormat.RichText)
+        self._config_label.setStyleSheet(STATUS_BAR_CONFIG_LABEL_STYLESHEET)
+
+        self._issues_label = QLabel()
+        self._issues_label.setTextFormat(Qt.TextFormat.RichText)
+        self._issues_label.setStyleSheet(STATUS_BAR_ISSUES_LABEL_STYLESHEET)
+
+        self._performance_label = QLabel()
+        self._performance_label.setTextFormat(Qt.TextFormat.RichText)
+        self._performance_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._performance_label.setStyleSheet(STATUS_BAR_PERFORMANCE_LABEL_STYLESHEET)
+
+        self.addWidget(self._capture_label)
+        self.addWidget(self._config_label)
+        self.addWidget(self._issues_label)
+        self.addPermanentWidget(self._performance_label)
+
+    def set_texts(self, *, capture: str, config: str, issues: str, performance: str) -> None:
+        """Update all four status label texts at once."""
+        self._capture_label.setText(capture)
+        self._config_label.setText(config)
+        self._issues_label.setText(issues)
+        self._issues_label.setVisible(bool(issues))
+        self._performance_label.setText(performance)
+
+
+class SessionTableSection(QWidget):
+    """Self-contained collapsible widget containing a session table with header controls."""
+
+    section_toggled = Signal()
+    table_model: SessionTableModel
+    table_view: SessionTableView
+    expand_button: QPushButton
+    collapse_button: QToolButton
+    _clear_button: QPushButton
+    _is_expanded: bool
+
+    def __init__(
+        self,
+        *,
+        is_connected: bool,
+        column_names: list[str],
+        clear_slot: Callable[[], None],
+        parent: QWidget | None = None,
+    ) -> None:
+        """Build the header, table, and expand button for a collapsible session section."""
+        super().__init__(parent)
+
+        self._section_name = 'Connected' if is_connected else 'Disconnected'
+        self.last_count: int = -1
+        self._selected_count: int = 0
+        self._is_expanded = True
+
+        self._is_connected = is_connected
+        self._rows_keyboard_editing = False
+
+        if is_connected:
+            accent = '#327546'
+            expand_button_stylesheet = CONNECTED_EXPAND_BUTTON_STYLESHEET
+            collapse_tooltip = 'Masquer le tableau des joueurs connectés'
+            clear_tooltip = 'Effacer tous les joueurs connectés' if Settings.gui_disconnected_players_enabled else 'Effacer tous les joueurs'
+            expand_tooltip = 'Afficher le tableau des joueurs connectés'
+            configured_column = Settings.gui_connected_table_sort_column
+            sort_order = Qt.SortOrder.AscendingOrder if Settings.gui_connected_table_sort_order == 'Ascending' else Qt.SortOrder.DescendingOrder
+            sort_column_name = (
+                configured_column if configured_column in column_names else ('Last Rejoin' if 'Last Rejoin' in column_names else (column_names[0] if column_names else ''))
+            )
+        else:
+            accent = '#943b3b'
+            expand_button_stylesheet = DISCONNECTED_EXPAND_BUTTON_STYLESHEET
+            collapse_tooltip = 'Masquer le tableau des joueurs déconnectés'
+            clear_tooltip = 'Effacer tous les joueurs déconnectés'
+            expand_tooltip = 'Afficher le tableau des joueurs déconnectés'
+            configured_column = Settings.gui_disconnected_table_sort_column
+            sort_order = Qt.SortOrder.AscendingOrder if Settings.gui_disconnected_table_sort_order == 'Ascending' else Qt.SortOrder.DescendingOrder
+            sort_column_name = (
+                configured_column if configured_column in column_names else ('Last Seen' if 'Last Seen' in column_names else (column_names[0] if column_names else ''))
+            )
+
+        # Header container
+        header_container = QFrame()
+        header_container.setObjectName('sectionBar')
+        header_container.setStyleSheet(section_bar_qss(accent))
+        header_container.setFixedHeight(46)
+        header_layout = QHBoxLayout(header_container)
+        header_layout.setContentsMargins(10, 4, 10, 8)
+        header_layout.setSpacing(8)
+
+        icon_label = QLabel()
+        icon_label.setFixedSize(40, 34)
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_label.setPixmap(_svg_file_to_pixmap(_PLAYER_ICON_PATH, 24))
+
+        self._header_label = QLabel(self._header_label_text())
+        self._header_label.setObjectName('sectionTitle')
+        self._header_label.setAutoFillBackground(False)
+
+        clear_button = QPushButton('EFFACER')
+        clear_button.setStyleSheet(SECTION_CLEAR_BUTTON_STYLESHEET)
+        clear_button.setToolTip(clear_tooltip)
+        clear_button.clicked.connect(clear_slot)
+        self._clear_button = clear_button
+
+        collapse_button = QToolButton()
+        collapse_button.setIcon(QIcon((RESOURCES_DIR_PATH / 'icons' / 'collapse_table.svg').as_posix()))
+        collapse_button.setIconSize(QSize(16, 16))
+        collapse_button.setToolTip(collapse_tooltip)
+        collapse_button.clicked.connect(self.minimize)
+        self.collapse_button = collapse_button
+
+        icon_title_pair = QHBoxLayout()
+        icon_title_pair.setSpacing(1)
+        icon_title_pair.setContentsMargins(0, 0, 0, 0)
+        icon_title_pair.addWidget(icon_label)
+        icon_title_pair.addWidget(self._header_label)
+        header_layout.addLayout(icon_title_pair)
+        header_layout.addStretch(1)
+
+        # Search controls — text input and column selector
+        self._search_combo = QComboBox()
+        self._search_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._search_combo.addItem('Toutes les colonnes')
+        self._search_combo.setItemData(0, -1)
+        for column_index, column_name in enumerate(column_names):
+            if column_name not in SEARCHABLE_COLUMN_EXCLUSIONS:
+                self._search_combo.addItem(tr(column_name))
+                self._search_combo.setItemData(self._search_combo.count() - 1, column_index)
+        if not is_connected:
+            search_table_name = 'disconnected players'
+        elif Settings.gui_disconnected_players_enabled:
+            search_table_name = 'connected players'
+        else:
+            search_table_name = 'players'
+        self._search_combo.setToolTip(
+            f'Choisir la colonne où chercher dans le tableau {search_table_name}',
+        )
+        self._search_combo.currentIndexChanged.connect(self._on_search_column_changed)
+
+        self._search_bar = QLineEdit()
+        self._search_bar.setPlaceholderText('Rechercher...')
+        self._search_bar.setMinimumWidth(160)
+        self._search_bar.textChanged.connect(self._on_search_changed)
+        apply_search_icon(self._search_bar)
+
+        search_pair = QHBoxLayout()
+        search_pair.setSpacing(3)
+        search_pair.setContentsMargins(0, 0, 0, 0)
+        search_pair.addWidget(self._search_bar)
+        search_pair.addWidget(self._search_combo)
+        header_layout.addLayout(search_pair)
+        header_layout.addStretch(1)
+
+        # Pagination controls — rows per page
+        rows_label = QLabel('Lignes :')
+        rows_label.setToolTip('Lignes par page (0 = tout afficher)')
+
+        initial_rpp = Settings.gui_connected_table_rows_per_page if is_connected else Settings.gui_disconnected_table_rows_per_page
+
+        self._rows_per_page_spinbox = QSpinBox()
+        self._rows_per_page_spinbox.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._rows_per_page_spinbox.setRange(0, 5000)
+        self._rows_per_page_spinbox.setMinimumWidth(95)
+        self._rows_per_page_spinbox.setSpecialValueText('Tout')
+        self._rows_per_page_spinbox.setValue(initial_rpp)
+        self._rows_per_page_spinbox.setToolTip(
+            f'Limiter le nombre de {self._rows_per_page_tooltip_noun()} par page. Mettre 0 pour tout afficher.',
+        )
+        self._rows_per_page_spinbox.setKeyboardTracking(False)
+        self._rows_per_page_spinbox.valueChanged.connect(self._handle_rows_per_page_changed)
+        self._rows_per_page_spinbox.editingFinished.connect(self._finalize_rows_edit)
+        self._install_spinbox_input_filter(self._rows_per_page_spinbox)
+
+        rows_pair = QHBoxLayout()
+        rows_pair.setSpacing(3)
+        rows_pair.setContentsMargins(0, 0, 0, 0)
+        rows_pair.addWidget(rows_label)
+        rows_pair.addWidget(self._rows_per_page_spinbox)
+        header_layout.addLayout(rows_pair)
+
+        # Pagination controls — page number
+        page_label = QLabel('Page :')
+        page_label.setToolTip('Page actuelle quand les lignes sont limitées.')
+
+        self._page_spinbox = QSpinBox()
+        self._page_spinbox.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._page_spinbox.setRange(1, 1)
+        self._page_spinbox.setToolTip("Passer d'une page à l'autre quand une limite est définie.")
+        self._page_spinbox.setSuffix(' / 1')
+        self._page_spinbox.valueChanged.connect(self._handle_page_changed)
+        self._install_spinbox_input_filter(self._page_spinbox)
+
+        page_pair = QHBoxLayout()
+        page_pair.setSpacing(3)
+        page_pair.setContentsMargins(0, 0, 0, 0)
+        page_pair.addWidget(page_label)
+        page_pair.addWidget(self._page_spinbox)
+        header_layout.addLayout(page_pair)
+
+        nav_separator = QFrame()
+        nav_separator.setFrameShape(QFrame.Shape.VLine)
+        nav_separator.setFrameShadow(QFrame.Shadow.Sunken)
+        nav_separator.setStyleSheet(SECTION_HEADER_SEPARATOR_STYLESHEET)
+        header_layout.addWidget(nav_separator)
+
+        # Internal paging state
+        self._rows_per_page: int = initial_rpp
+        self._current_page: int = 1
+        self._total_pages: int = 1
+
+        # Seed PaginationState so the worker thread knows the initial values
+        if is_connected:
+            PaginationState.set_connected(rows_per_page=initial_rpp, page=1)
+        else:
+            PaginationState.set_disconnected(rows_per_page=initial_rpp, page=1)
+
+        header_layout.addWidget(clear_button)
+        header_layout.addWidget(collapse_button)
+
+        # Table model and view
+        self.table_model = SessionTableModel(column_names)
+        self.table_view = SessionTableView(
+            self.table_model,
+            column_names.index(sort_column_name) if sort_column_name in column_names else 0,
+            sort_order,
+            is_connected_table=is_connected,
+        )
+        self.table_view.setItemDelegate(
+            SearchHighlightDelegate(
+                self.table_view,
+                self._search_bar.text,
+                self._get_active_search_column,
+            ),
+        )
+        arrow_up_path = (RESOURCES_DIR_PATH / 'icons' / 'arrow_up.svg').as_posix()
+        arrow_down_path = (RESOURCES_DIR_PATH / 'icons' / 'arrow_down.svg').as_posix()
+        arrow_left_path = (RESOURCES_DIR_PATH / 'icons' / 'arrow_left.svg').as_posix()
+        arrow_right_path = (RESOURCES_DIR_PATH / 'icons' / 'arrow_right.svg').as_posix()
+
+        # Dynamic "glassmorphism" tint to match the container's accent color perfectly
+        if is_connected:
+            table_bg = '#0a120e'
+            alt_bg = '#0e1a13'
+            grid_color = '#162b1f'
+            sel_bg = '#1f3d2c'
+            header_bg = '#122418'
+            header_text = '#a8d5ba'
+            sb_track_bg = '#080e0b'
+            sb_handle_bg = '#235231'
+            sb_handle_hover = '#3ea660'
+            sb_handle_pressed = '#4fc877'
+        else:
+            table_bg = '#140a0a'
+            alt_bg = '#1f0e0e'
+            grid_color = '#331616'
+            sel_bg = '#4d2121'
+            header_bg = '#241212'
+            header_text = '#d5a8a8'
+            sb_track_bg = '#0e0707'
+            sb_handle_bg = '#612626'
+            sb_handle_hover = '#b84a4a'
+            sb_handle_pressed = '#d95b5b'
+
+        self.table_view.setStyleSheet(f"""
+            QTableView {{
+                border-left: 2px solid {accent};
+                border-right: 2px solid {accent};
+                border-bottom: 2px solid {accent};
+                border-top: none;
+                border-bottom-left-radius: 8px;
+                border-bottom-right-radius: 8px;
+                background-color: {table_bg};
+                alternate-background-color: {alt_bg};
+                color: #efd7f3;
+                gridline-color: {grid_color};
+                selection-background-color: {sel_bg};
+                selection-color: #ffffff;
+            }}
+            QTableView::viewport {{
+                border-bottom-left-radius: 6px;
+                border-bottom-right-radius: 6px;
+                background-color: {table_bg};
+            }}
+            QTableView::item {{
+                border-bottom: 1px solid {grid_color};
+                background-color: transparent;
+            }}
+            QTableView::item:selected {{
+                background-color: {sel_bg};
+                color: #ffffff;
+            }}
+            QHeaderView {{
+                background-color: {header_bg};
+                border: none;
+            }}
+            QHeaderView::section {{
+                background-color: {header_bg};
+                color: {header_text};
+                padding: 6px;
+                border: 1px solid {grid_color};
+                border-bottom: 1px solid {accent};
+                font-weight: bold;
+                font-size: 10pt;
+            }}
+            QHeaderView::section:hover {{
+                background-color: {sel_bg};
+            }}
+            QScrollBar:vertical {{
+                background-color: {sb_track_bg};
+                width: 12px;
+                margin: 16px 0px 16px 0px;
+                border: none;
+                border-radius: 6px;
+            }}
+            QScrollBar::handle:vertical {{
+                background-color: {sb_handle_bg};
+                min-height: 28px;
+                border-radius: 4px;
+                margin: 2px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background-color: {sb_handle_hover};
+            }}
+            QScrollBar::handle:vertical:pressed {{
+                background-color: {sb_handle_pressed};
+            }}
+            QScrollBar::sub-line:vertical {{
+                subcontrol-position: top;
+                subcontrol-origin: margin;
+                height: 14px;
+                width: 12px;
+                background-color: transparent;
+                border: none;
+            }}
+            QScrollBar::sub-line:vertical:hover {{
+                background-color: rgba(255, 255, 255, 0.08);
+                border-radius: 3px;
+            }}
+            QScrollBar::sub-line:vertical:pressed {{
+                background-color: rgba(255, 255, 255, 0.15);
+                border-radius: 3px;
+            }}
+            QScrollBar::add-line:vertical {{
+                subcontrol-position: bottom;
+                subcontrol-origin: margin;
+                height: 14px;
+                width: 12px;
+                background-color: transparent;
+                border: none;
+            }}
+            QScrollBar::add-line:vertical:hover {{
+                background-color: rgba(255, 255, 255, 0.08);
+                border-radius: 3px;
+            }}
+            QScrollBar::add-line:vertical:pressed {{
+                background-color: rgba(255, 255, 255, 0.15);
+                border-radius: 3px;
+            }}
+            QScrollBar::up-arrow:vertical {{
+                image: url("{arrow_up_path}");
+                width: 8px;
+                height: 8px;
+            }}
+            QScrollBar::down-arrow:vertical {{
+                image: url("{arrow_down_path}");
+                width: 8px;
+                height: 8px;
+            }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                background: none;
+            }}
+            QScrollBar:horizontal {{
+                background-color: {sb_track_bg};
+                height: 12px;
+                margin: 0px 16px 0px 16px;
+                border: none;
+                border-radius: 6px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background-color: {sb_handle_bg};
+                min-width: 28px;
+                border-radius: 4px;
+                margin: 2px;
+            }}
+            QScrollBar::handle:horizontal:hover {{
+                background-color: {sb_handle_hover};
+            }}
+            QScrollBar::handle:horizontal:pressed {{
+                background-color: {sb_handle_pressed};
+            }}
+            QScrollBar::sub-line:horizontal {{
+                subcontrol-position: left;
+                subcontrol-origin: margin;
+                width: 14px;
+                height: 12px;
+                background-color: transparent;
+                border: none;
+            }}
+            QScrollBar::sub-line:horizontal:hover {{
+                background-color: rgba(255, 255, 255, 0.08);
+                border-radius: 3px;
+            }}
+            QScrollBar::sub-line:horizontal:pressed {{
+                background-color: rgba(255, 255, 255, 0.15);
+                border-radius: 3px;
+            }}
+            QScrollBar::add-line:horizontal {{
+                subcontrol-position: right;
+                subcontrol-origin: margin;
+                width: 14px;
+                height: 12px;
+                background-color: transparent;
+                border: none;
+            }}
+            QScrollBar::add-line:horizontal:hover {{
+                background-color: rgba(255, 255, 255, 0.08);
+                border-radius: 3px;
+            }}
+            QScrollBar::add-line:horizontal:pressed {{
+                background-color: rgba(255, 255, 255, 0.15);
+                border-radius: 3px;
+            }}
+            QScrollBar::left-arrow:horizontal {{
+                image: url("{arrow_left_path}");
+                width: 8px;
+                height: 8px;
+            }}
+            QScrollBar::right-arrow:horizontal {{
+                image: url("{arrow_right_path}");
+                width: 8px;
+                height: 8px;
+            }}
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+                background: none;
+            }}
+            QScrollBar::corner {{
+                background-color: {table_bg};
+                border: none;
+            }}
+        """)
+        self.table_view.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Custom)
+        self.table_view.setup_static_column_resizing()
+        self.table_model.view = self.table_view
+
+        search_shortcut = QShortcut(QKeySequence('Ctrl+F'), self.table_view)
+        search_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        search_shortcut.activated.connect(self._search_bar.setFocus)
+
+        # Expand button (shown when section is collapsed; laid out by MainWindow, not this section)
+        self.expand_button = QPushButton(f'Afficher {self._expand_button_noun()} (0)')
+        _expand_icon = QIcon((RESOURCES_DIR_PATH / 'icons' / 'expand_table.svg').as_posix())
+        self.expand_button.setIcon(make_padded_icon(_expand_icon, (16, 16), 8))
+        self.expand_button.setIconSize(QSize(16 + 8, 16))
+        self.expand_button.setToolTip(expand_tooltip)
+        self.expand_button.setStyleSheet(expand_button_stylesheet)
+        self.expand_button.setVisible(False)
+        self.expand_button.clicked.connect(self.expand)
+
+        # Section layout
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(header_container)
+        layout.addWidget(self.table_view, 1)
+
+        self.setMinimumHeight(scale_by_ui(110))
+
+        self.table_view.selectionModel().selectionChanged.connect(self._on_selection_changed)
+
+    @property
+    def _header_widget(self) -> QWidget:
+        """The header container widget, accessed via the header label's parent."""
+        return cast('QWidget', self._header_label.parentWidget())
+
+    @property
+    def is_expanded(self) -> bool:
+        """True when the section content (header + table) is visible."""
+        return self._is_expanded
+
+    def expand(self) -> None:
+        """Show section content and hide the expand button."""
+        self._is_expanded = True
+        self.expand_button.setVisible(False)
+        self.setVisible(True)
+        self.table_model.refresh_view()
+        self.section_toggled.emit()
+
+    def minimize(self) -> None:
+        """Collapse section to just an expand button."""
+        self._is_expanded = False
+        self.setVisible(False)
+        self.expand_button.setText(
+            f'Afficher {self._expand_button_noun()} ({max(self.last_count, 0)})',
+        )
+        self.expand_button.setVisible(True)
+        self.section_toggled.emit()
+
+    def update_current_count(self, count: int) -> None:
+        """Update the player count, refresh the header, and sync the expand button text."""
+        self.last_count = count
+        self._update_header_label()
+        if not self.is_expanded:
+            self.expand_button.setText(
+                f'Afficher {self._expand_button_noun()} ({count})',
+            )
+
+    def clear_table(self) -> None:
+        """Clear all table data and reset selection count."""
+        self.table_model.reset_columns()
+        self._selected_count = 0
+        self._update_header_label()
+        self.table_view.reset_initial_data_sizing()
+        self.table_view.setup_static_column_resizing()
+
+    def update_columns(self, column_names: list[str]) -> None:
+        """Replace the column set at runtime and reconfigure the view."""
+        if self._section_name == 'Connected':
+            configured_column = Settings.gui_connected_table_sort_column
+            sort_order = Qt.SortOrder.AscendingOrder if Settings.gui_connected_table_sort_order == 'Ascending' else Qt.SortOrder.DescendingOrder
+            fallback = 'Last Rejoin'
+        else:
+            configured_column = Settings.gui_disconnected_table_sort_column
+            sort_order = Qt.SortOrder.AscendingOrder if Settings.gui_disconnected_table_sort_order == 'Ascending' else Qt.SortOrder.DescendingOrder
+            fallback = 'Last Seen'
+
+        if configured_column in column_names:
+            sort_column_name = configured_column
+        elif fallback in column_names:
+            sort_column_name = fallback
+        elif column_names:
+            sort_column_name = column_names[0]
+        else:
+            sort_column_name = None
+
+        self.table_model.reset_columns(column_names)
+        if sort_column_name is not None:
+            self.table_view.apply_sort(sort_column_name, sort_order)
+        self.table_view.setup_static_column_resizing()
+
+        # Refresh search combo to match new column set, preserving current selection
+        self._search_combo.blockSignals(True)  # noqa: FBT003
+        current_text = self._search_combo.currentText()
+        self._search_combo.clear()
+        self._search_combo.addItem('Toutes les colonnes')
+        self._search_combo.setItemData(0, -1)
+        for column_index, column_name in enumerate(column_names):
+            if column_name not in SEARCHABLE_COLUMN_EXCLUSIONS:
+                self._search_combo.addItem(tr(column_name))
+                self._search_combo.setItemData(self._search_combo.count() - 1, column_index)
+        restored_index = self._search_combo.findText(current_text)
+        self._search_combo.setCurrentIndex(max(0, restored_index))
+        self._search_combo.blockSignals(False)  # noqa: FBT003
+        # Resync SearchState in case the column index shifted after rebuild
+        self._on_search_column_changed(self._search_combo.currentIndex())
+
+    def apply_sort_from_settings(self) -> None:
+        """Apply sort column and order from current Settings."""
+        if self._section_name == 'Connected':
+            target_column = Settings.gui_connected_table_sort_column
+            target_order = Qt.SortOrder.AscendingOrder if Settings.gui_connected_table_sort_order == 'Ascending' else Qt.SortOrder.DescendingOrder
+        else:
+            target_column = Settings.gui_disconnected_table_sort_column
+            target_order = Qt.SortOrder.AscendingOrder if Settings.gui_disconnected_table_sort_order == 'Ascending' else Qt.SortOrder.DescendingOrder
+        self.table_view.apply_sort(target_column, target_order)
+
+    def set_all_enabled(self, *, enabled: bool) -> None:
+        """Enable or disable all interactive child widgets."""
+        self._header_widget.setEnabled(enabled)
+        self.table_view.setEnabled(enabled)
+        self.expand_button.setEnabled(enabled)
+
+    def update_disconnected_players_state(self) -> None:
+        """Update header label and tooltips when the disconnected players setting changes."""
+        self._update_header_label()
+        if self._is_connected:
+            disconnected_enabled = Settings.gui_disconnected_players_enabled
+            self._clear_button.setToolTip('Effacer tous les joueurs connectés' if disconnected_enabled else 'Effacer tous les joueurs')
+            search_table_name = 'connected players' if disconnected_enabled else 'players'
+            self._search_combo.setToolTip(f'Choisir la colonne où chercher dans le tableau {search_table_name}')
+            self._rows_per_page_spinbox.setToolTip(f'Limiter le nombre de {self._rows_per_page_tooltip_noun()} par page. Mettre 0 pour tout afficher.')
+
+    def _expand_button_noun(self) -> str:
+        """Return the player label for the expand button, respecting the disconnected players setting."""
+        if self._is_connected:
+            return 'Joueurs connectés' if Settings.gui_disconnected_players_enabled else 'Joueurs'
+        return 'Joueurs déconnectés'
+
+    def _rows_per_page_tooltip_noun(self) -> str:
+        """Return the player noun used in the rows-per-page tooltip, respecting the disconnected players setting."""
+        if self._is_connected:
+            return 'connected players' if Settings.gui_disconnected_players_enabled else 'players'
+        return 'disconnected players'
+
+    def _header_label_text(self) -> str:
+        intro = ('Joueurs connectés' if Settings.gui_disconnected_players_enabled else 'Joueurs') if self._section_name == 'Connected' else 'Joueurs déconnectés'
+        base = f'{intro} ({max(0, self.last_count)})'
+        if self._selected_count > 0:
+            noun = 'player' if self._selected_count == 1 else 'players'
+            return f'{base} ({self._selected_count} {noun} selected)'
+        return base
+
+    def _update_header_label(self) -> None:
+        self._header_label.setText(self._header_label_text())
+
+    def refresh_selection_count(self) -> None:
+        """Recompute the selected-row count and update the header label."""
+        self._on_selection_changed()
+
+    def _on_selection_changed(self) -> None:
+        self._selected_count = len({i.row() for i in self.table_view.selectionModel().selectedIndexes()})
+        self._update_header_label()
+
+    # -- Pagination handlers --------------------------------------------------
+
+    def _handle_rows_per_page_changed(self, value: int) -> None:
+        self._rows_per_page = max(value, 0)
+        self._current_page, self._total_pages = self._sync_paging_controls(
+            total_rows=max(self.last_count, 0),
+            rows_per_page=self._rows_per_page,
+            requested_page=1,
+        )
+        self._push_pagination_state()
+        self._update_header_label()
+
+    def apply_pagination_from_settings(self) -> None:
+        """Apply configured rows per page from Settings to this table section."""
+        configured_rows = Settings.gui_connected_table_rows_per_page if self._is_connected else Settings.gui_disconnected_table_rows_per_page
+        if self._rows_per_page == configured_rows:
+            return
+        self._rows_per_page = max(configured_rows, 0)
+        self._rows_per_page_spinbox.blockSignals(True)  # noqa: FBT003
+        self._rows_per_page_spinbox.setValue(self._rows_per_page)
+        self._rows_per_page_spinbox.blockSignals(False)  # noqa: FBT003
+        self._current_page, self._total_pages = self._sync_paging_controls(
+            total_rows=max(self.last_count, 0),
+            rows_per_page=self._rows_per_page,
+            requested_page=1,
+        )
+        self._push_pagination_state()
+        self._update_header_label()
+
+    def _handle_page_changed(self, value: int) -> None:
+        self._current_page = max(value, 1)
+        self._push_pagination_state()
+        self._update_header_label()
+
+    def _finalize_rows_edit(self) -> None:
+        self._handle_rows_per_page_changed(self._rows_per_page_spinbox.value())
+        self._rows_per_page_spinbox.clearFocus()
+
+    def _push_pagination_state(self) -> None:
+        """Write current pagination state to the shared PaginationState."""
+        if self._is_connected:
+            PaginationState.set_connected(rows_per_page=self._rows_per_page, page=self._current_page)
+        else:
+            PaginationState.set_disconnected(rows_per_page=self._rows_per_page, page=self._current_page)
+
+    def _sync_paging_controls(
+        self,
+        *,
+        total_rows: int,
+        rows_per_page: int,
+        requested_page: int,
+    ) -> tuple[int, int]:
+        """Update the page spinbox range/value and return (clamped_page, total_pages)."""
+        if not rows_per_page:
+            total_pages = 1
+            page = 1
+        else:
+            total_pages = max(1, (total_rows + rows_per_page - 1) // rows_per_page)
+            page = min(max(1, requested_page), total_pages)
+
+        self._page_spinbox.blockSignals(True)  # noqa: FBT003
+        self._page_spinbox.setMinimum(1)
+        self._page_spinbox.setMaximum(total_pages)
+        self._page_spinbox.setEnabled(0 < rows_per_page < total_rows)
+        self._page_spinbox.setValue(page)
+        self._page_spinbox.blockSignals(False)  # noqa: FBT003
+
+        return page, total_pages
+
+    def sync_paging_from_payload(
+        self,
+        *,
+        total_count: int,
+        rows_per_page: int,
+        page: int,
+    ) -> None:
+        """Called from _update_gui to keep spinbox decorations in sync."""
+        self._rows_per_page = rows_per_page
+
+        if not self._rows_keyboard_editing:
+            self._rows_per_page_spinbox.setRange(0, 5000)
+            if self._rows_per_page_spinbox.value() != self._rows_per_page:
+                self._rows_per_page_spinbox.blockSignals(True)  # noqa: FBT003
+                self._rows_per_page_spinbox.setValue(self._rows_per_page)
+                self._rows_per_page_spinbox.blockSignals(False)  # noqa: FBT003
+            if self._rows_per_page > 0:
+                self._rows_per_page_spinbox.setPrefix(f'{total_count} / ')
+                self._rows_per_page_spinbox.setSuffix('')
+                self._rows_per_page_spinbox.setSpecialValueText('')
+            else:
+                self._rows_per_page_spinbox.setPrefix('')
+                self._rows_per_page_spinbox.setSuffix('')
+                self._rows_per_page_spinbox.setSpecialValueText(f'Tout ({total_count})')
+
+        self._current_page, self._total_pages = self._sync_paging_controls(
+            total_rows=max(self.last_count, 0),
+            rows_per_page=self._rows_per_page,
+            requested_page=page,
+        )
+        if self._current_page != page:
+            self._push_pagination_state()
+
+        if not self._rows_keyboard_editing:
+            self._page_spinbox.setSuffix(f' / {self._total_pages}')
+
+    def _install_spinbox_input_filter(self, spinbox: QSpinBox) -> None:
+        """Attach an event filter that tracks keyboard vs. wheel editing and ignores unfocused wheels."""
+        line_edit = spinbox.lineEdit()
+        if not line_edit:
+            return
+
+        section = self
+
+        class _SpinboxInputGuard(QObject):
+            @override
+            def eventFilter(self, a0: QObject | None, a1: QEvent | None) -> bool:
+                """Track input method to distinguish keyboard edits from wheel/spin changes."""
+                _ = a0
+                if a1 is None:
+                    return False
+                event_type = a1.type()
+                if event_type == QEvent.Type.KeyPress:
+                    section.set_keyboard_editing(is_editing=True)
+                elif event_type in (QEvent.Type.FocusOut, QEvent.Type.Hide):
+                    section.set_keyboard_editing(is_editing=False)
+                elif event_type == QEvent.Type.Wheel:
+                    section.set_keyboard_editing(is_editing=False)
+                    if not spinbox.hasFocus():
+                        return True
+                return False
+
+        guard = _SpinboxInputGuard(self)
+        spinbox.installEventFilter(guard)
+        line_edit.installEventFilter(guard)
+        if not hasattr(self, '_spinbox_guards'):
+            self._spinbox_guards: list[QObject] = []
+        self._spinbox_guards.append(guard)
+
+    def set_keyboard_editing(self, *, is_editing: bool) -> None:
+        """Set the keyboard editing state for the rows-per-page spinbox."""
+        self._rows_keyboard_editing = is_editing
+
+    def _get_active_search_column(self) -> int:
+        raw_column = self._search_combo.itemData(self._search_combo.currentIndex())
+        return raw_column if isinstance(raw_column, int) else -1
+
+    def _on_search_changed(self, text: str) -> None:
+        raw = self._search_combo.itemData(self._search_combo.currentIndex())
+        column = raw if isinstance(raw, int) else -1
+        if self._is_connected:
+            SearchState.set_connected(text, column)
+            PaginationState.set_connected_page(1)
+        else:
+            SearchState.set_disconnected(text, column)
+            PaginationState.set_disconnected_page(1)
+        self.table_view.viewport().update()
+
+    def _on_search_column_changed(self, index: int) -> None:
+        raw = self._search_combo.itemData(index)
+        column = raw if isinstance(raw, int) else -1
+        text = self._search_bar.text()
+        if self._is_connected:
+            SearchState.set_connected(text, column)
+            PaginationState.set_connected_page(1)
+        else:
+            SearchState.set_disconnected(text, column)
+            PaginationState.set_disconnected_page(1)
+        self.table_view.viewport().update()

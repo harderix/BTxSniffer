@@ -1,0 +1,807 @@
+"""Session Sniffer application entry point and main GUI/capture orchestration."""
+
+import atexit
+import functools
+import logging
+import os
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+from threading import Event, Lock, Thread
+
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QMessageBox
+
+from session_sniffer import msgbox
+from session_sniffer.background import (
+    ensure_looky_core_running,
+    handle_detection_notification,
+    hostname_core,
+    iplookup_core,
+    is_gta5_relay_ip,
+    monitor_gta5_relay_task,
+    pinger_core,
+    player_rates_core,
+    process_userip_task,
+    submit_global_detections_check,
+)
+from session_sniffer.background.events import gui_closed__event
+from session_sniffer.capture.arp_spoofing import ArpSpoofingController
+from session_sniffer.capture.filters import build_capture_filters
+from session_sniffer.capture.interface_setup import get_filtered_capture_interfaces, populate_network_interfaces_info
+from session_sniffer.capture.packet_capture import CaptureConfig, CaptureHolder, Packet, PacketCapture
+from session_sniffer.capture.process_monitor import ensure_process_monitor_running
+from session_sniffer.capture.utils.check_capture_filters import check_broadcast_multicast_support
+from session_sniffer.capture.utils.npcap_checker import ensure_npcap_installed
+from session_sniffer.constants.local import COMBO_RULES_PATH, DETECTIONS_JSON_PATH, SCRIPT_DIR, SETTINGS_PATH, USER_SCRIPTS_DIR_PATH
+from session_sniffer.constants.standalone import TITLE
+from session_sniffer.constants.standard import LOCAL_TZ
+from session_sniffer.ctypes_console import hide_console_window
+from session_sniffer.error_messages import format_capture_interrupted_message, format_outdated_packages_message
+from session_sniffer.exceptions import UnsupportedPlatformError
+from session_sniffer.guis.app import app
+from session_sniffer.guis.exceptions import UnsupportedScreenResolutionError
+from session_sniffer.guis.interface_selection import select_interface
+from session_sniffer.guis.main_window import MainWindow
+from session_sniffer.guis.player_rate_graph import DEFAULT_MAX_HISTORY
+from session_sniffer.guis.relay_conflict import prompt_to_disable_gta5_relay_if_filtered
+from session_sniffer.guis.splash_screen import SplashScreen
+from session_sniffer.guis.theme import get_stylesheet
+from session_sniffer.guis.utils import compute_ui_scale, get_screen_size, initialize_ui_scale
+from session_sniffer.launcher.package_checker import check_packages_version, get_dependencies_from_pyproject
+from session_sniffer.logging_setup import register_secret_provider, setup_logging
+from session_sniffer.models.player import PacketInfo, Player, PlayerUserIPDetection
+from session_sniffer.networking.ctypes_adapters_info import get_adapters_info
+from session_sniffer.networking.geolite2.service import update_and_initialize_geolite2_readers
+from session_sniffer.networking.interface import AllInterfaces, Interface, SelectedInterfaceRow
+from session_sniffer.networking.ip_range import check_ip_against_ranges
+from session_sniffer.networking.manuf_lookup import MacLookup
+from session_sniffer.networking.ps3_resolver import extract_ps3_username
+from session_sniffer.networking.reverse_dns import reset_resolver_cache
+from session_sniffer.player.combo_rules import ComboRulesManager
+from session_sniffer.player.detections import GUIDetectionSettings
+from session_sniffer.player.registry import PlayersRegistry
+from session_sniffer.player.userip import UserIPDatabases
+from session_sniffer.rendering_core.renderer import rendering_core
+from session_sniffer.rendering_core.types import CaptureState, CaptureStats, GeoIP2Readers, GUIRenderingState
+from session_sniffer.settings import Settings
+from session_sniffer.updater import UpdateCheckOutcome, check_for_updates
+from session_sniffer.utils import is_pyinstaller_compiled
+from session_sniffer.webserver import start_webserver_from_settings
+
+setup_logging(console_level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+USER_SCRIPTS_DIR_PATH.mkdir(parents=True, exist_ok=True)
+
+
+_MAX_ADAPTER_LOST_RECOVERY_ATTEMPTS = 60
+
+
+def main() -> None:
+    """Run environment checks, initialize dependencies, and start the GUI."""
+    if is_pyinstaller_compiled():
+        old_exe = Path(sys.executable).with_name(f'{Path(sys.executable).name}.old')
+        try:
+            old_exe.unlink()
+        except OSError as e:
+            logger.debug('Failed to remove old executable %s: %s', old_exe, e)
+
+    hide_console_window()
+
+    os.chdir(SCRIPT_DIR)
+
+    if sys.platform not in ('win32', 'linux'):
+        raise UnsupportedPlatformError(sys.platform)
+
+    Settings.load_from_settings_file(SETTINGS_PATH)
+
+    try:
+        screen_size = get_screen_size()
+    except UnsupportedScreenResolutionError as e:
+        logger.warning('Unsupported screen resolution: %s', e)
+        prompt_text = e.msgbox_text + '\n\nVeux-tu ignorer cet avertissement et continuer quand même ?'
+        response = msgbox.show(
+            title="Résolution d'écran non prise en charge",
+            text=prompt_text,
+            style=msgbox.Style.MB_YESNO | msgbox.Style.MB_ICONWARNING | msgbox.Style.MB_TOPMOST,
+        )
+        if response == msgbox.ReturnValues.IDYES:
+            Settings.gui_ignore_screen_resolution_warning = True
+            Settings.rewrite_settings_file()
+            screen_size = get_screen_size()
+        else:
+            sys.exit(1)
+
+    initialize_ui_scale(screen_size)
+    app.setStyle('Fusion')
+    app.setStyleSheet(get_stylesheet(compute_ui_scale(screen_size)))
+
+    splash = SplashScreen()
+    splash.show()
+    # Own splash msgboxes so they appear above it without being globally topmost
+    msgbox.set_owner_hwnd(splash.winId())
+
+    preload_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix='Preload')
+    update_check_future = preload_executor.submit(check_for_updates, updater_channel=Settings.updater_channel)
+    npcap_future = preload_executor.submit(ensure_npcap_installed)
+    geolite2_future = preload_executor.submit(
+        update_and_initialize_geolite2_readers,
+        progress_callback=functools.partial(splash.update_progress, target_message='Initialisation des bases GeoLite2'),
+    )
+    mac_lookup_future = preload_executor.submit(MacLookup.load)
+
+    def _populate_interfaces_after_mac() -> None:
+        mac_lookup_future.result()  # Vendor name lookups require MacLookup to be loaded first.
+        populate_network_interfaces_info()
+
+    network_interfaces_future = preload_executor.submit(_populate_interfaces_after_mac)
+
+    if not is_pyinstaller_compiled():
+        splash.update_status('Vérification des versions des paquets Python')
+        dependencies = get_dependencies_from_pyproject()
+        outdated_packages = check_packages_version(dependencies)
+        if outdated_packages:
+            msgbox_message = format_outdated_packages_message(
+                app_title=TITLE,
+                outdated_packages=outdated_packages,
+            )
+
+            msgbox_style = msgbox.Style.MB_YESNO | msgbox.Style.MB_ICONEXCLAMATION | msgbox.Style.MB_SETFOREGROUND
+            msgbox_title = TITLE
+            errorlevel = msgbox.show(msgbox_title, msgbox_message, msgbox_style)
+            if errorlevel != msgbox.ReturnValues.IDYES:
+                preload_executor.shutdown(wait=False)
+                sys.exit(0)
+
+    splash.update_status('Application des réglages de Settings.ini')
+    register_secret_provider(lambda: Settings.discord_webhook_url)
+    register_secret_provider(lambda: Settings.looky_api_key)
+    register_secret_provider(lambda: Settings.webserver_password)
+    Settings.rebuild_blocked_ip_ranges()
+    CaptureStats.resize_history_deques(DEFAULT_MAX_HISTORY)
+
+    GUIDetectionSettings.load_from_file_or_defaults(DETECTIONS_JSON_PATH)
+    ComboRulesManager.load_from_file(COMBO_RULES_PATH)
+
+    splash.update_status('Vérification des mises à jour')
+    outcome, pending_download = splash.run_with_spinner(update_check_future.result)
+    if outcome is UpdateCheckOutcome.ABORT:
+        preload_executor.shutdown(wait=False)
+        sys.exit(0)
+    if pending_download is not None:
+        splash.lower_to_back()
+        pending_download()
+
+    splash.update_status('Vérification du pilote de capture' if sys.platform != 'win32' else 'Vérification du pilote Npcap')
+    splash.run_with_spinner(npcap_future.result)
+
+    splash.update_status('Initialisation des bases GeoLite2')
+    geoip2_enabled, geolite2_asn_reader, geolite2_city_reader, geolite2_country_reader = splash.run_with_spinner(geolite2_future.result)
+
+    splash.update_status('Initialisation de la recherche MAC')
+    splash.run_with_spinner(mac_lookup_future.result)
+    preload_executor.shutdown(wait=False)
+
+    splash.update_status("Choix de l'interface réseau")
+    splash.run_with_spinner(network_interfaces_future.result)
+
+    available_interfaces: list[Interface] = []
+    capture_interfaces = splash.run_with_spinner(get_filtered_capture_interfaces)
+
+    for device_name, friendly_name in capture_interfaces:
+        interface = AllInterfaces.get_interface_by_name(friendly_name)
+        if interface is None:
+            continue
+
+        interface.identity.device_name = device_name
+
+        if (
+            Settings.capture_interface_name is not None
+            and interface.identity.name.casefold() == Settings.capture_interface_name.casefold()
+            and interface.identity.name != Settings.capture_interface_name
+        ):
+            Settings.capture_interface_name = interface.identity.name
+            Settings.rewrite_settings_file()
+
+        available_interfaces.append(interface)
+
+    msgbox.set_owner_hwnd(0)
+    selected_interface = select_interface(
+        available_interfaces,
+        screen_size,
+        before_dialog=splash.lower_to_back,
+    )
+    if selected_interface is None:
+        sys.exit(0)
+
+    CaptureState.apply_interface_names(
+        is_neighbour=selected_interface.is_neighbour,
+        name=selected_interface.name,
+        ip=selected_interface.ip_address,
+        interface_type=selected_interface.interface.interface_type,
+    )
+
+    splash.update_status('Connexion en cours')
+    need_rewrite_settings = False
+
+    if Settings.capture_interface_name is None or selected_interface.name != Settings.capture_interface_name:
+        Settings.capture_interface_name = selected_interface.name
+        need_rewrite_settings = True
+
+    if selected_interface.mac_address != Settings.capture_mac_address:
+        Settings.capture_mac_address = selected_interface.mac_address
+        need_rewrite_settings = True
+
+    if selected_interface.ip_address != Settings.capture_ip_address:
+        Settings.capture_ip_address = selected_interface.ip_address
+        need_rewrite_settings = True
+
+    if need_rewrite_settings:
+        Settings.rewrite_settings_file()
+
+    broadcast_support, multicast_support = splash.run_with_spinner(check_broadcast_multicast_support, selected_interface.device_name or selected_interface.name)
+
+    capture_filter_str, display_filter_fn = build_capture_filters(
+        capture_ip_address=selected_interface.ip_address,
+        broadcast_support=broadcast_support,
+        multicast_support=multicast_support,
+    )
+
+    splash.update_status('Démarrage de la capture de paquets')
+
+    def packet_callback(packet: Packet) -> None:
+        """Callback function to process each captured packet."""
+        if capture_holder.is_restart_requested():
+            return
+
+        if packet.ip.src == Settings.capture_ip_address:
+            target_ip = packet.ip.dst
+            target_port = packet.port.dst
+            local_port = packet.port.src
+            sent_by_local_host = True
+        elif packet.ip.dst == Settings.capture_ip_address:
+            target_ip = packet.ip.src
+            target_port = packet.port.src
+            local_port = packet.port.dst
+            sent_by_local_host = False
+        else:
+            return
+
+        if (
+            Settings.capture_filter_process_pid > 0
+            and CaptureState.is_local_capture()
+            and CaptureState.target_process_running
+            and local_port not in CaptureState.target_process_udp_ports
+        ):
+            return
+
+        if Settings.blocked_ip_ranges and check_ip_against_ranges(target_ip, Settings.blocked_ip_ranges):
+            return
+
+        packet_latency = datetime.now(tz=LOCAL_TZ) - packet.datetime
+        CaptureStats.packets_latencies.append((packet.datetime, packet_latency))
+        CaptureStats.total_packets_captured += 1
+
+        is_gta5_packet = (
+            Settings.is_gta5_feature_set()
+            and CaptureState.is_local_capture()
+            and CaptureState.gta5_is_running
+            and local_port in CaptureState.gta5_udp_ports
+        )
+        is_rdr2_packet = (
+            Settings.is_rdr2_feature_set()
+            and CaptureState.is_local_capture()
+            and CaptureState.rdr2_is_running
+            and local_port in CaptureState.rdr2_udp_ports
+        )
+
+        matched_player = PlayersRegistry.get_player_by_ip(target_ip)
+        if matched_player is None:
+            matched_player = PlayersRegistry.add_connected_player(
+                Player(
+                    ip=target_ip,
+                    packet=PacketInfo(
+                        datetime=packet.datetime,
+                        length=packet.length,
+                        port=target_port,
+                        sent_by_local_host=sent_by_local_host,
+                    ),
+                ),
+            )
+
+            handle_detection_notification(matched_player, 'player_joined_session')
+
+        elif not PlayersRegistry.is_player_connected(matched_player):
+            matched_player.mark_as_rejoined(
+                port=target_port,
+                packet_datetime=packet.datetime,
+                packet_length=packet.length,
+                sent_by_local_host=sent_by_local_host,
+            )
+            PlayersRegistry.move_player_to_connected(matched_player)
+
+            handle_detection_notification(matched_player, 'player_rejoined_session')
+        else:
+            matched_player.mark_as_seen(
+                port=target_port,
+                packet_datetime=packet.datetime,
+                packet_length=packet.length,
+                sent_by_local_host=sent_by_local_host,
+            )
+
+        if is_gta5_packet and not matched_player.is_gta5_process:
+            matched_player.is_gta5_process = True
+
+        if is_rdr2_packet and not matched_player.is_rdr2_process:
+            matched_player.is_rdr2_process = True
+
+        if (
+            matched_player.ps3_username is None
+            and packet.payload is not None
+            and (resolved_ps3_username := extract_ps3_username(packet.payload, sent_by_local_host=sent_by_local_host))
+        ):
+            matched_player.ps3_username = resolved_ps3_username
+
+        if not matched_player.detection_checked:
+            matched_player.detection_checked = True
+            submit_global_detections_check(matched_player)
+
+        if not matched_player.relay_monitor_started:
+            matched_player.relay_monitor_started = True
+            if Settings.is_gta5_feature_set() and (CaptureState.gta5_is_running or not CaptureState.is_local_capture()) and is_gta5_relay_ip(matched_player.ip):
+                Thread(
+                    target=monitor_gta5_relay_task,
+                    name=f'GTA5RelayMonitor-{matched_player.ip}',
+                    args=(matched_player,),
+                    daemon=True,
+                ).start()
+
+        if (not matched_player.userip_detection or not matched_player.userip_detection.as_processed_task) and UserIPDatabases.is_known_ip(matched_player.ip):
+            resolved_userip = UserIPDatabases.resolve_userip(matched_player.ip)
+            if resolved_userip is None:
+                # is_known_ip() just returned True, so this should not happen; guard defensively.
+                logger.warning('resolve_userip returned None immediately after is_known_ip for ip=%s — skipping UserIP task', matched_player.ip)
+            else:
+                matched_player.userip_detection = PlayerUserIPDetection(
+                    time=packet.datetime.strftime('%H:%M:%S'),
+                    date_time=packet.datetime.strftime('%Y-%m-%d_%H:%M:%S'),
+                )
+                Thread(
+                    target=process_userip_task,
+                    name=f'ProcessUserIPTask-{matched_player.ip}-connected',
+                    args=(matched_player, resolved_userip, 'connected'),
+                    daemon=True,
+                ).start()
+
+    _adapter_lost_event = Event()
+
+    def on_overflow_drop() -> None:
+        CaptureStats.total_packets_captured += 1
+        CaptureStats.packets_overflow_dropped += 1
+
+    capture = PacketCapture(
+        CaptureConfig(
+            interface=selected_interface,
+            broadcast_support=broadcast_support,
+            multicast_support=multicast_support,
+            capture_filter=capture_filter_str,
+            display_filter_fn=display_filter_fn,
+            include_payload=Settings.capture_ps3_name_resolver,
+            callback=packet_callback,
+            on_capture_lost=_adapter_lost_event.set,
+            max_latency_seconds=lambda: float(Settings.capture_overflow_timer),
+            on_overflow_drop=on_overflow_drop,
+        ),
+    )
+    capture_holder = CaptureHolder(capture)
+
+    splash.run_with_spinner(capture.start)
+    CaptureStats.capture_started_at = time.monotonic()
+
+    _arp_failed_event = Event()
+    ArpSpoofingController.configure(capture_holder, on_failed=_arp_failed_event.set)
+    if Settings.capture_arp_spoofing:
+        ArpSpoofingController.start(selected_interface)
+
+    splash.update_status("Préparation de l'interface")
+
+    # Start rendering_core and player_rates_core now so they run concurrently with
+    # MainWindow construction. By the time the window is built the first snapshot
+    # is almost always already published, making the subsequent wait near-instant.
+    player_rates_core__thread = Thread(target=player_rates_core, name='player_rates_core', daemon=True)
+    player_rates_core__thread.start()
+
+    rendering_core__thread = Thread(
+        target=rendering_core,
+        name='rendering_core',
+        args=(
+            capture_holder,
+            GeoIP2Readers(
+                enabled=geoip2_enabled,
+                asn_reader=geolite2_asn_reader,
+                city_reader=geolite2_city_reader,
+                country_reader=geolite2_country_reader,
+            ),
+        ),
+        daemon=True,
+    )
+    rendering_core__thread.start()
+
+    def _switch_interface(*, initial_tab: int = 0) -> None:
+        window.set_change_interface_button_enabled(enabled=False)
+
+        # Build interface list from the existing registry without calling
+        # refresh_available_interfaces(), which blocks the GUI thread via COM/ICS APIs.
+        # The dialog's live-refresh timer handles that from within its own event loop.
+        new_available_interfaces: list[Interface] = []
+        for _device_name, _friendly_name in get_filtered_capture_interfaces():
+            _interface = AllInterfaces.get_interface_by_name(_friendly_name)
+            if _interface is None:
+                continue
+            _interface.identity.device_name = _device_name
+            new_available_interfaces.append(_interface)
+
+        new_interface = select_interface(
+            new_available_interfaces,
+            screen_size,
+            force_dialog=True,
+            initial_tab=initial_tab,
+        )
+
+        if new_interface is None:
+            window.set_change_interface_button_enabled(enabled=True)
+            return
+
+        current_selected = capture_holder.config.interface
+
+        current_adapter_guid = current_selected.interface.identity.adapter_guid
+        new_adapter_guid = new_interface.interface.identity.adapter_guid
+
+        is_same_adapter = False
+        if not new_interface.is_neighbour and not current_selected.is_neighbour:
+            if current_adapter_guid is not None and new_adapter_guid is not None:
+                is_same_adapter = current_adapter_guid == new_adapter_guid
+            else:
+                is_same_adapter = (
+                    new_interface.name == current_selected.name
+                    and new_interface.mac_address == current_selected.mac_address
+                )
+        elif new_interface.is_neighbour and current_selected.is_neighbour:
+            if current_adapter_guid is not None and new_adapter_guid is not None:
+                is_same_adapter = (
+                    current_adapter_guid == new_adapter_guid
+                    and new_interface.ip_address == current_selected.ip_address
+                )
+            else:
+                is_same_adapter = (
+                    new_interface.name == current_selected.name
+                    and new_interface.ip_address == current_selected.ip_address
+                    and new_interface.mac_address == current_selected.mac_address
+                )
+
+        if is_same_adapter and capture_holder.is_running():
+            if Settings.capture_arp_spoofing:
+                if not ArpSpoofingController.is_running():
+                    ArpSpoofingController.start(new_interface)
+            else:
+                ArpSpoofingController.stop()
+            window.set_change_interface_button_enabled(enabled=True)
+            return
+
+        # Stop ARP spoofing first: the old ARP thread must not observe the new capture starting.
+        ArpSpoofingController.stop()
+
+        was_running = capture_holder.is_running()
+        if was_running:
+            capture_holder.stop()
+        window.set_interface_switching_mode(switching=True)
+
+        # Run the filter probe off the Qt thread so the UI stays responsive.
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix='InterfaceReselect') as _pool:
+            _future = _pool.submit(check_broadcast_multicast_support, new_interface.device_name or new_interface.name)
+            while not _future.done():
+                app.processEvents()
+                time.sleep(0.016)
+            new_broadcast, new_multicast = _future.result()
+
+        CaptureState.apply_interface_names(
+            is_neighbour=new_interface.is_neighbour,
+            name=new_interface.name,
+            ip=new_interface.ip_address,
+            interface_type=new_interface.interface.interface_type,
+        )
+        Settings.capture_interface_name = new_interface.name
+        Settings.capture_mac_address = new_interface.mac_address
+        Settings.capture_ip_address = new_interface.ip_address
+        Settings.rewrite_settings_file()
+
+        new_capture_filter, new_display_filter_fn = build_capture_filters(
+            capture_ip_address=new_interface.ip_address,
+            broadcast_support=new_broadcast,
+            multicast_support=new_multicast,
+        )
+
+        reset_resolver_cache()
+
+        if is_same_adapter:
+            logger.info(
+                'Resuming capture on same interface "%s" (IP: %s) — preserving player tables.',
+                new_interface.name,
+                new_interface.ip_address,
+            )
+        else:
+            is_same_physical_adapter = (
+                current_adapter_guid is not None and new_adapter_guid is not None and current_adapter_guid == new_adapter_guid
+            ) or current_selected.name == new_interface.name
+            if is_same_physical_adapter:
+                old_target = f'neighbour {current_selected.ip_address}' if current_selected.is_neighbour else f'host {current_selected.ip_address}'
+                new_target = f'neighbour {new_interface.ip_address}' if new_interface.is_neighbour else f'host {new_interface.ip_address}'
+                logger.info(
+                    'Switching capture target on "%s" from %s to %s — resetting player tables.',
+                    new_interface.name,
+                    old_target,
+                    new_target,
+                )
+            else:
+                logger.info(
+                    'Switching capture interface from "%s" to "%s" — resetting player tables.',
+                    current_selected.name,
+                    new_interface.name,
+                )
+            CaptureStats.reset_on_interface_switch()
+            window.reset_players_for_interface_switch()
+            window.reset_session_graph()
+
+        new_capture = PacketCapture(
+            CaptureConfig(
+                interface=new_interface,
+                broadcast_support=new_broadcast,
+                multicast_support=new_multicast,
+                capture_filter=new_capture_filter,
+                display_filter_fn=new_display_filter_fn,
+                include_payload=Settings.capture_ps3_name_resolver,
+                callback=packet_callback,
+                on_capture_lost=_adapter_lost_event.set,
+                max_latency_seconds=lambda: float(Settings.capture_overflow_timer),
+                on_overflow_drop=on_overflow_drop,
+            ),
+        )
+        new_capture.start()
+        CaptureStats.capture_started_at = time.monotonic()
+        capture_holder.set(new_capture)
+
+        if Settings.capture_arp_spoofing:
+            ArpSpoofingController.start(new_interface)
+
+        window.on_interface_switched()
+        window.set_interface_switching_mode(switching=False)
+
+    window = MainWindow(
+        screen_size,
+        capture_holder,
+        on_change_interface=_switch_interface,
+        on_open_hotspot=lambda: _switch_interface(initial_tab=1),
+    )
+
+    # Re-entry guard: adapter-lost and ARP-failed pollers can fire concurrently; non-blocking acquire skips the second.
+    _capture_lost_lock = Lock()
+
+    def _handle_capture_lost(*, stop_capture: bool, warning_message: str | None) -> None:
+        """Shared handler for any event that requires stopping capture and re-selecting an interface."""
+        if not _capture_lost_lock.acquire(blocking=False):
+            return
+        try:
+            if stop_capture and capture_holder.is_running():
+                capture_holder.stop()
+            window.on_interface_switched()
+            window.set_capture_toggle_enabled(enabled=False)
+            if warning_message is not None:
+                QMessageBox.warning(window, 'Capture interrompue', warning_message)
+            _switch_interface()
+        finally:
+            _capture_lost_lock.release()
+
+    _adapter_lost_attempts = 0
+
+    def _restart_capture_with_ip(new_ip: str) -> None:
+        """Silently restart packet capture with a specified IP address on the current interface."""
+        was_running = capture_holder.is_running()
+        if was_running:
+            capture_holder.stop()
+
+        new_capture_filter, new_display_filter_fn = build_capture_filters(
+            capture_ip_address=new_ip,
+            broadcast_support=capture_holder.config.broadcast_support,
+            multicast_support=capture_holder.config.multicast_support,
+        )
+
+        Settings.capture_ip_address = new_ip
+        Settings.rewrite_settings_file()
+
+        new_selected_interface = SelectedInterfaceRow(
+            interface=capture_holder.config.interface.interface,
+            ip_address=new_ip,
+            is_neighbour=capture_holder.config.interface.is_neighbour,
+        )
+        new_selected_interface.interface.ip_addresses = [new_ip]
+        registered_interface = AllInterfaces.get_interface_by_name(new_selected_interface.name)
+        if registered_interface is not None:
+            registered_interface.ip_addresses = [new_ip]
+
+        CaptureState.apply_interface_names(
+            is_neighbour=new_selected_interface.is_neighbour,
+            name=new_selected_interface.name,
+            ip=new_selected_interface.ip_address,
+            interface_type=new_selected_interface.interface.interface_type,
+        )
+        reset_resolver_cache()
+
+        new_capture = PacketCapture(
+            CaptureConfig(
+                interface=new_selected_interface,
+                broadcast_support=capture_holder.config.broadcast_support,
+                multicast_support=capture_holder.config.multicast_support,
+                capture_filter=new_capture_filter,
+                display_filter_fn=new_display_filter_fn,
+                include_payload=Settings.capture_ps3_name_resolver,
+                callback=packet_callback,
+                on_capture_lost=_adapter_lost_event.set,
+                max_latency_seconds=lambda: float(Settings.capture_overflow_timer),
+                on_overflow_drop=on_overflow_drop,
+            ),
+        )
+
+        new_capture.start()
+        CaptureStats.capture_started_at = time.monotonic()
+        capture_holder.set(new_capture)
+
+        if Settings.capture_arp_spoofing:
+            ArpSpoofingController.stop()
+            ArpSpoofingController.start(new_selected_interface)
+
+        window.on_interface_switched()
+
+    def _on_adapter_lost_poll() -> None:
+        """Poll for unexpected capture exits, attempt automatic silent recovery, or re-show the interface selection dialog."""
+        nonlocal _adapter_lost_attempts
+
+        if gui_closed__event.is_set():
+            return
+
+        if not _adapter_lost_event.is_set():
+            _adapter_lost_attempts = 0
+            return
+
+        current_selected = capture_holder.config.interface
+        adapter_guid = current_selected.interface.identity.adapter_guid
+
+        if not current_selected.is_neighbour and adapter_guid is not None:
+            _adapter_lost_attempts += 1
+            if _adapter_lost_attempts <= _MAX_ADAPTER_LOST_RECOVERY_ATTEMPTS:
+                matching_adapter = None
+                for adapter in get_adapters_info():
+                    if adapter.identity.adapter_guid == adapter_guid:
+                        matching_adapter = adapter
+                        break
+
+                if matching_adapter is None:
+                    logger.debug(
+                        'Capture adapter "%s" (GUID: %s) temporarily absent — waiting to recover (attempt %d/%d).',
+                        current_selected.name,
+                        adapter_guid,
+                        _adapter_lost_attempts,
+                        _MAX_ADAPTER_LOST_RECOVERY_ATTEMPTS,
+                    )
+                    return
+
+                if not matching_adapter.ipv4_addresses:
+                    logger.debug(
+                        'Capture adapter "%s" present but waiting for IPv4 assignment (attempt %d/%d).',
+                        matching_adapter.identity.friendly_name,
+                        _adapter_lost_attempts,
+                        _MAX_ADAPTER_LOST_RECOVERY_ATTEMPTS,
+                    )
+                    return
+
+                target_ip_address = matching_adapter.ipv4_addresses[0]
+                previous_ip_address = current_selected.ip_address
+                _adapter_lost_event.clear()
+
+                if previous_ip_address != target_ip_address:
+                    logger.info(
+                        'Capture interface "%s" IP changed from %s to %s — resuming capture.',
+                        matching_adapter.identity.friendly_name,
+                        previous_ip_address,
+                        target_ip_address,
+                    )
+                else:
+                    logger.info(
+                        'Capture interface "%s" reconnected (IP unchanged: %s) — resuming capture.',
+                        matching_adapter.identity.friendly_name,
+                        target_ip_address,
+                    )
+
+                if matching_adapter.identity.friendly_name:
+                    current_selected.interface.identity.name = matching_adapter.identity.friendly_name
+                    Settings.capture_interface_name = matching_adapter.identity.friendly_name
+                if matching_adapter.identity.mac_address:
+                    current_selected.interface.identity.mac_address = matching_adapter.identity.mac_address
+                    Settings.capture_mac_address = matching_adapter.identity.mac_address
+
+                _restart_capture_with_ip(target_ip_address)
+                return
+
+        _adapter_lost_attempts = 0
+        _adapter_lost_event.clear()
+        _handle_capture_lost(stop_capture=False, warning_message=format_capture_interrupted_message())
+
+    _adapter_lost_timer = QTimer()
+    _adapter_lost_timer.setInterval(500)
+    _adapter_lost_timer.timeout.connect(_on_adapter_lost_poll)
+    _adapter_lost_timer.start()
+
+    def _on_arp_failed_poll() -> None:
+        """Poll for ARP spoofing failures and re-show the interface selection dialog."""
+        if gui_closed__event.is_set() or not _arp_failed_event.is_set():
+            return
+        _arp_failed_event.clear()
+        _handle_capture_lost(stop_capture=True, warning_message=None)
+
+    _arp_failed_timer = QTimer()
+    _arp_failed_timer.setInterval(500)
+    _arp_failed_timer.timeout.connect(_on_arp_failed_poll)
+    _arp_failed_timer.start()
+
+    ensure_process_monitor_running()
+
+    splash.run_with_spinner(GUIRenderingState.wait_rendering_snapshot, last_seen_version=0)
+    app.processEvents()
+
+    splash.finish_loading()
+
+    def _reveal_main_window() -> None:
+        # Lower splash before showing main window so it can rise above it;
+        # show while splash still owns the foreground to avoid activateWindow() being ignored.
+        splash.lower_to_back()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        QTimer.singleShot(100, splash.close_splash)
+
+    QTimer.singleShot(200, _reveal_main_window)
+
+    def _check_startup_relay_conflict() -> None:
+        """Warn at startup when relay detection is enabled but relay IPs are being filtered out."""
+        prompt_to_disable_gta5_relay_if_filtered(window, context='startup')
+
+    QTimer.singleShot(2000, _check_startup_relay_conflict)
+
+    if Settings.webserver_enabled:
+        start_webserver_from_settings()
+
+    hostname_core__thread = Thread(target=hostname_core, name='hostname_core', daemon=True)
+    hostname_core__thread.start()
+
+    iplookup_core__thread = Thread(target=iplookup_core, name='iplookup_core', daemon=True)
+    iplookup_core__thread.start()
+
+    pinger_core__thread = Thread(target=pinger_core, name='pinger_core', daemon=True)
+    pinger_core__thread.start()
+
+    ensure_looky_core_running()
+
+    def _show_discord_intro() -> None:
+        window.show_discord_intro()
+
+    if Settings.show_discord_popup:
+        QTimer.singleShot(3000, _show_discord_intro)
+
+    sys.exit(app.exec())
+
+
+if __name__ == '__main__':
+    atexit.register(logging.shutdown)
+    main()

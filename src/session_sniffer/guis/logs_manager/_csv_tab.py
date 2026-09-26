@@ -1,0 +1,745 @@
+"""CSV log tab — reusable for UserIP_Logging.csv and Detection_Logging.csv."""
+
+import csv
+import shutil
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from ipaddress import IPv4Address
+from typing import TYPE_CHECKING, override
+
+from PySide6.QtCore import QItemSelectionModel, QModelIndex, QPoint, Qt, QUrl
+from PySide6.QtGui import (
+    QAction,
+    QDesktopServices,
+    QIcon,
+    QKeySequence,
+    QResizeEvent,
+    QShortcut,
+    QShowEvent,
+    QStandardItem,
+    QStandardItemModel,
+)
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QComboBox,
+    QFileDialog,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QTableView,
+    QVBoxLayout,
+    QWidget,
+)
+
+from session_sniffer.constants.local import RESOURCES_DIR_PATH
+from session_sniffer.constants.standalone import TITLE
+from session_sniffer.guis.file_watch import DebouncedFileWatcher
+from session_sniffer.guis.logs_manager._helpers import (
+    DATE_COLUMN_NAME,
+    DATE_FILTER_7_DAYS,
+    DATE_FILTER_30_DAYS,
+    DATE_FILTER_CHOICES,
+    DATE_FILTER_TODAY,
+    MAX_CSV_ROWS,
+    MultiColumnFilterProxy,
+    create_search_input,
+    file_metadata_text,
+    open_file_location,
+    purge_log_file,
+)
+from session_sniffer.guis.stylesheets import DIALOG_BUTTON_STYLESHEET, DIALOG_DANGER_BUTTON_STYLESHEET, SVG_ICON_CONTEXT_MENU_STYLESHEET
+from session_sniffer.guis.table_column_resizing import add_column_sizing_actions
+from session_sniffer.guis.tables_player_actions import (
+    create_multi_tcp_ping_menu,
+    create_multi_udp_ping_menu,
+    ping_ip,
+    scan_ports_ip,
+    show_detailed_ip_lookup,
+    tcp_port_ping,
+    udp_port_ping,
+    web_ping,
+)
+from session_sniffer.guis.utils import SearchHighlightDelegate, set_clipboard_text
+from session_sniffer.text_utils import pluralize
+from session_sniffer.guis.i18n import install_translated_header, tr, TrComboBox
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+
+_DEFAULT_HEADER_BASE_WIDTHS: dict[str, int] = {
+    'Database': 120,
+    'Detection': 220,
+    'Usernames': 180,
+    'IP': 125,
+    'Date': 95,
+    'Time': 85,
+    'Country': 160,
+}
+
+
+@dataclass(slots=True)
+class CsvLogTabConfig:
+    """Configuration bundle for `CsvLogTab`."""
+
+    file_path: Path
+    expected_headers: tuple[str, ...]
+    default_sort_columns: tuple[str, ...] = field(default_factory=tuple)
+    default_sort_order: Qt.SortOrder = Qt.SortOrder.AscendingOrder
+    stretch_column: int | None = None
+    column_min_widths: dict[int, int] = field(default_factory=dict[int, int])
+
+
+class CsvLogTab(QWidget):
+    """Structured CSV log viewer with table, search, filter, sort, and management actions."""
+
+    def __init__(
+        self,
+        config: CsvLogTabConfig,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._file_path = config.file_path
+        self._expected_headers = config.expected_headers
+        self._default_sort_columns = config.default_sort_columns
+        self._default_sort_order = config.default_sort_order
+        self._stretch_column = config.stretch_column
+        self._column_min_widths = config.column_min_widths
+        self._all_rows: list[list[str]] = []
+        self._truncated = False
+        self._initial_loaded = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        # --- Top bar: search + column filter + date filter + refresh + count ---
+        top_bar = QHBoxLayout()
+
+        self._search_input = create_search_input(top_bar, 'Filtrer les entrées…', self._on_search_changed)
+
+        top_bar.addWidget(QLabel('Colonne :'))
+        self._column_combo = QComboBox()
+        self._column_combo.addItem('Toutes les colonnes', -1)
+        for i, column_name in enumerate(self._expected_headers):
+            self._column_combo.addItem(tr(column_name), i)
+        self._column_combo.currentIndexChanged.connect(self._on_column_filter_changed)
+        top_bar.addWidget(self._column_combo)
+
+        top_bar.addWidget(QLabel('Période :'))
+        self._date_combo = TrComboBox()
+        for choice in DATE_FILTER_CHOICES:
+            self._date_combo.addItem(choice)
+        self._date_combo.currentTextChanged.connect(self._on_date_filter_changed)
+        top_bar.addWidget(self._date_combo)
+
+        self._count_label = QLabel('')
+        top_bar.addWidget(self._count_label)
+
+        layout.addLayout(top_bar)
+
+        # --- Table ---
+        self._model = QStandardItemModel(self)
+        self._model.setHorizontalHeaderLabels(list(self._expected_headers))
+
+        self._proxy = MultiColumnFilterProxy(self)
+        self._proxy.setSourceModel(self._model)
+        self._proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+
+        self._table = QTableView()
+        install_translated_header(self._table)  # BTX: French column titles
+        self._table.setModel(self._proxy)
+        self._table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._table.setShowGrid(True)
+        self._table.setGridStyle(Qt.PenStyle.SolidLine)
+        self._table.setCornerButtonEnabled(False)
+        self._table.setSortingEnabled(True)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setAlternatingRowColors(True)
+
+        QShortcut(QKeySequence('Ctrl+C'), self._table).activated.connect(self._copy_selected)
+        QShortcut(QKeySequence('Ctrl+A'), self._table).activated.connect(self._table.selectAll)
+
+        v_header = self._table.verticalHeader()
+        if v_header:
+            v_header.setVisible(False)
+            v_header.setDefaultSectionSize(26)
+
+        horizontal_header = self._table.horizontalHeader()
+        if horizontal_header:
+            horizontal_header.setHighlightSections(False)
+            horizontal_header.setStretchLastSection(False)
+            horizontal_header.setSectionsMovable(True)
+            horizontal_header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            horizontal_header.customContextMenuRequested.connect(self._on_header_context_menu)
+        self._reset_column_sizes()
+
+        layout.addWidget(self._table, stretch=1)
+
+        self._table.setItemDelegate(
+            SearchHighlightDelegate(
+                self._table,
+                self._search_input.text,
+                self._get_active_search_column,
+            )
+        )
+        self._table.setWordWrap(False)
+
+        self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_table_context_menu)
+
+        # --- File metadata ---
+        self._metadata_label = QLabel('')
+        layout.addWidget(self._metadata_label)
+
+        # --- Bottom buttons ---
+        button_row = QHBoxLayout()
+
+        copy_button = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), ' Copier la sélection')
+        copy_button.setStyleSheet(DIALOG_BUTTON_STYLESHEET)
+        copy_button.setToolTip('Copier les lignes sélectionnées')
+        copy_button.clicked.connect(self._copy_selected)
+        button_row.addWidget(copy_button)
+
+        export_button = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'export.svg')), ' Exporter sous...')
+        export_button.setStyleSheet(DIALOG_BUTTON_STYLESHEET)
+        export_button.setToolTip('Exporter tout le log dans un nouveau fichier CSV')
+        export_button.clicked.connect(self._export_as)
+        button_row.addWidget(export_button)
+
+        button_row.addStretch()
+
+        delete_rows_button = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')), ' Supprimer les lignes')
+        delete_rows_button.setStyleSheet(DIALOG_DANGER_BUTTON_STYLESHEET)
+        delete_rows_button.setToolTip('Supprimer les lignes sélectionnées du fichier de log')
+        delete_rows_button.clicked.connect(self._delete_selected_rows)
+        button_row.addWidget(delete_rows_button)
+
+        purge_button = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')), ' Vider le fichier')
+        purge_button.setStyleSheet(DIALOG_DANGER_BUTTON_STYLESHEET)
+        purge_button.setToolTip('Effacer toutes les entrées de ce fichier de log (une sauvegarde est créée avant)')
+        purge_button.clicked.connect(self._purge_file)
+        button_row.addWidget(purge_button)
+
+        label = " Ouvrir l'emplacement du dossier" if self._file_path.is_dir() else " Ouvrir l'emplacement du fichier"
+        open_location_button = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'folder.svg')), label)
+        open_location_button.setStyleSheet(DIALOG_BUTTON_STYLESHEET)
+        open_location_button.setToolTip("Ouvrir le dossier dans l'explorateur Windows")
+        open_location_button.clicked.connect(lambda: open_file_location(self._file_path))
+        button_row.addWidget(open_location_button)
+
+        open_file_button = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'text_editor.svg')), ' Ouvrir le fichier')
+        open_file_button.setStyleSheet(DIALOG_BUTTON_STYLESHEET)
+        open_file_button.setToolTip("Ouvrir le fichier de log dans l'éditeur de texte par défaut")
+        open_file_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._file_path))))
+        button_row.addWidget(open_file_button)
+
+        layout.addLayout(button_row)
+
+        # --- Auto-refresh from disk ---
+        self._watcher = DebouncedFileWatcher(self, self.load_data)
+        self._watcher.watch(files=[self._file_path], directories=[self._file_path.parent])
+
+        # Initial load
+        self.load_data()
+
+    # ------------------------------------------------------------------
+    # Data loading
+    # ------------------------------------------------------------------
+
+    def load_data(self) -> None:
+        """Read the CSV file and populate the table model."""
+        scrollbar = self._table.verticalScrollBar()
+        previous_scroll = scrollbar.value() if scrollbar else 0
+
+        self._model.removeRows(0, self._model.rowCount())
+        self._all_rows.clear()
+        self._truncated = False
+
+        if not self._file_path.exists():
+            self._update_counts()
+            self._metadata_label.setText(file_metadata_text(self._file_path))
+            self._initial_loaded = True
+            return
+
+        with self._file_path.open(newline='', encoding='utf-8') as file:
+            reader = csv.reader(file)
+            file_headers = next(reader, None)
+            if file_headers is None:
+                self._update_counts()
+                self._metadata_label.setText(file_metadata_text(self._file_path))
+                self._initial_loaded = True
+                return
+
+            self._model.setHorizontalHeaderLabels(file_headers)
+            self._rebuild_column_combo(file_headers)
+
+            skipped = 0
+            for row_num, row in enumerate(reader):
+                if row_num >= MAX_CSV_ROWS:
+                    self._truncated = True
+                    break
+                if len(row) != len(file_headers):
+                    skipped += 1
+                    continue
+                items = [QStandardItem(cell) for cell in row]
+                for item in items:
+                    item.setEditable(False)
+                self._model.appendRow(items)
+                self._all_rows.append(row)
+
+            # Only surface malformed-row warnings on the first load; auto-refreshes stay silent.
+            if skipped and not self._initial_loaded:
+                QMessageBox.warning(
+                    self,
+                    TITLE,
+                    f'{skipped} ligne(s) mal formée(s) ignorée(s) au chargement de {self._file_path.name}.',
+                )
+
+        if self._initial_loaded:
+            if scrollbar:
+                scrollbar.setValue(min(previous_scroll, scrollbar.maximum()))
+        else:
+            self._apply_default_sort()
+            self._initial_loaded = True
+        self._update_counts()
+        self._reset_column_sizes()
+        self._metadata_label.setText(file_metadata_text(self._file_path))
+
+    def _apply_default_sort(self) -> None:
+        """Apply the default sort using stable-sort chaining."""
+        if not self._default_sort_columns:
+            return
+        header_labels = [self._model.headerData(column, Qt.Orientation.Horizontal) for column in range(self._model.columnCount())]
+        primary_column_index: int | None = None
+        # Sort in reverse order so the first column in the tuple ends up as the primary sort key.
+        for column_name in reversed(self._default_sort_columns):
+            if column_name in header_labels:
+                column_index = header_labels.index(column_name)
+                self._proxy.sort(column_index, self._default_sort_order)
+                primary_column_index = column_index
+        # Sync the header sort indicator with the primary sort column.
+        if primary_column_index is not None:
+            h_header = self._table.horizontalHeader()
+            if h_header:
+                h_header.setSortIndicator(primary_column_index, self._default_sort_order)
+
+    # ------------------------------------------------------------------
+    # Filtering
+    # ------------------------------------------------------------------
+
+    def _rebuild_column_combo(self, headers: list[str]) -> None:
+        """Rebuild the column filter combo box from actual file headers."""
+        self._column_combo.blockSignals(True)  # noqa: FBT003
+        self._column_combo.clear()
+        self._column_combo.addItem('Toutes les colonnes', -1)
+        for i, header in enumerate(headers):
+            self._column_combo.addItem(tr(header), i)
+        self._column_combo.blockSignals(False)  # noqa: FBT003
+
+    def _get_active_search_column(self) -> int:
+        column_data = self._column_combo.currentData()
+        return column_data if isinstance(column_data, int) else -1
+
+    def set_search(self, text: str) -> None:
+        """Programmatically set the search text and focus the search input."""
+        self._search_input.setText(text)
+        self._search_input.setFocus()
+
+    def _on_search_changed(self, text: str) -> None:
+        self._proxy.setFilterFixedString(text)
+        self._update_counts()
+        viewport = self._table.viewport()
+        if viewport:
+            viewport.update()
+
+    def _on_column_filter_changed(self) -> None:
+        column = self._column_combo.currentData()
+        if column is None:
+            column = -1
+        self._proxy.set_filter_column(column)
+        self._update_counts()
+        viewport = self._table.viewport()
+        if viewport:
+            viewport.update()
+
+    def _on_date_filter_changed(self, choice: str) -> None:
+        headers = [self._model.headerData(i, Qt.Orientation.Horizontal) for i in range(self._model.columnCount())]
+        date_column = -1
+        for i, header in enumerate(headers):
+            if header == DATE_COLUMN_NAME:
+                date_column = i
+                break
+
+        cutoff: datetime | None = None
+        now = datetime.now(tz=UTC)
+        if choice == DATE_FILTER_TODAY:
+            cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif choice == DATE_FILTER_7_DAYS:
+            cutoff = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+        elif choice == DATE_FILTER_30_DAYS:
+            cutoff = (now - timedelta(days=30)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+        self._proxy.set_date_filter(date_column, cutoff)
+        self._update_counts()
+
+    def _update_counts(self) -> None:
+        total = self._model.rowCount()
+        visible = self._proxy.rowCount()
+        parts = [f'{total} entrée(s)']
+        if visible != total:
+            parts.append(f'{visible} visible(s)')
+        if self._truncated:
+            parts.append(f'(affichage limité à {MAX_CSV_ROWS:,} lignes)')
+        self._count_label.setText('  |  '.join(parts))
+
+    @override
+    def showEvent(self, event: QShowEvent) -> None:
+        """Adjust column widths when the log tab is shown."""
+        super().showEvent(event)
+        self._reset_column_sizes()
+
+    @override
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        """Adjust column widths when the log tab is resized."""
+        super().resizeEvent(event)
+        self._reset_column_sizes()
+
+    def _reset_column_sizes(self) -> None:
+        """Reset column widths back to their initial default layout and stretch flexible column."""
+        horizontal_header = self._table.horizontalHeader()
+        if not horizontal_header:
+            return
+        total_columns = self._model.columnCount()
+        if not total_columns:
+            return
+        for column_index in range(total_columns):
+            horizontal_header.setSectionResizeMode(column_index, QHeaderView.ResizeMode.Interactive)
+            if column_index in self._column_min_widths:
+                horizontal_header.resizeSection(column_index, self._column_min_widths[column_index])
+            else:
+                header_name = str(self._model.headerData(column_index, Qt.Orientation.Horizontal) or '')
+                base_width = _DEFAULT_HEADER_BASE_WIDTHS.get(header_name, 100)
+                horizontal_header.resizeSection(column_index, base_width)
+
+        viewport = self._table.viewport()
+        available_width = viewport.width() if viewport and viewport.width() > 0 else self._table.width()
+
+        if self._stretch_column is not None and 0 <= self._stretch_column < total_columns:
+            configured_widths = sum(
+                self._table.columnWidth(column_index)
+                for column_index in range(total_columns)
+                if column_index != self._stretch_column and not horizontal_header.isSectionHidden(column_index)
+            )
+            stretch_width = max(150, available_width - configured_widths)
+            horizontal_header.resizeSection(self._stretch_column, stretch_width)
+        else:
+            last_visible_column: int | None = None
+            for column_index in range(total_columns):
+                if not horizontal_header.isSectionHidden(column_index):
+                    last_visible_column = column_index
+            if last_visible_column is not None:
+                other_widths = sum(
+                    self._table.columnWidth(column_index)
+                    for column_index in range(total_columns)
+                    if column_index != last_visible_column and not horizontal_header.isSectionHidden(column_index)
+                )
+                last_width = max(100, available_width - other_widths)
+                horizontal_header.resizeSection(last_visible_column, last_width)
+
+    # ------------------------------------------------------------------
+    # Column visibility & Context Menus
+    # ------------------------------------------------------------------
+
+    def _on_header_context_menu(self, pos: QPoint) -> None:
+        h_header = self._table.horizontalHeader()
+        if not h_header:
+            return
+        clicked_column = h_header.logicalIndexAt(pos)
+        menu = QMenu(self)
+        menu.setStyleSheet(SVG_ICON_CONTEXT_MENU_STYLESHEET)
+        menu.setToolTipsVisible(True)
+        add_column_sizing_actions(menu, self._table, clicked_column=clicked_column, on_reset=self._reset_column_sizes)
+        menu.addSeparator()
+        for column in range(self._model.columnCount()):
+            name = self._model.headerData(column, Qt.Orientation.Horizontal)
+            action = QAction(str(name), menu)
+            action.setCheckable(True)
+            action.setChecked(not self._table.isColumnHidden(column))
+            action.setData(column)
+            action.toggled.connect(self._toggle_column_visibility)
+            menu.addAction(action)
+        menu.popup(h_header.mapToGlobal(pos))
+
+    def _on_table_context_menu(self, pos: QPoint) -> None:
+        """Show a context menu on a right-clicked table row with quick-access actions."""
+        index = self._table.indexAt(pos)
+        selection_model = self._table.selectionModel()
+        if selection_model and index.isValid() and not selection_model.isSelected(index):
+            selection_model.select(index, QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows)
+
+        selected_rows = selection_model.selectedRows() if selection_model else []
+        has_selection = bool(selected_rows)
+
+        menu = QMenu(self)
+        menu.setStyleSheet(SVG_ICON_CONTEXT_MENU_STYLESHEET)
+        menu.setToolTipsVisible(True)
+
+        copy_label = f'Copier les lignes sélectionnées ({len(selected_rows)})' if len(selected_rows) > 1 else 'Copier la ligne sélectionnée'
+        copy_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), copy_label, menu)
+        copy_action.setShortcut('Ctrl+C')
+        copy_action.setToolTip('Copier les lignes sélectionnées au format CSV.')
+        copy_action.setEnabled(has_selection)
+        copy_action.triggered.connect(self._copy_selected)
+        menu.addAction(copy_action)
+
+        copy_all_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), 'Tout copier', menu)
+        copy_all_action.setToolTip('Copier toutes les lignes visibles au format CSV.')
+        copy_all_action.setEnabled(self._proxy.rowCount() > 0)
+        copy_all_action.triggered.connect(self._copy_all)
+        menu.addAction(copy_all_action)
+
+        menu.addSeparator()
+
+        select_all_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'select_all.svg')), 'Tout sélectionner', menu)
+        select_all_action.setShortcut('Ctrl+A')
+        select_all_action.setToolTip('Sélectionner toutes les lignes visibles.')
+        select_all_action.setEnabled(self._proxy.rowCount() > 0)
+        select_all_action.triggered.connect(self._table.selectAll)
+        menu.addAction(select_all_action)
+
+        clear_selection_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'unselect_all.svg')), 'Effacer la sélection', menu)
+        clear_selection_action.setToolTip('Désélectionner toutes les lignes.')
+        clear_selection_action.triggered.connect(self._table.clearSelection)
+        menu.addAction(clear_selection_action)
+
+        selected_ips = self._get_selected_ips(index, selection_model)
+
+        if len(selected_ips) == 1:
+            menu.addSeparator()
+
+            lookup_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'info.svg')), "Détails de l'IP…", menu)
+            lookup_action.setToolTip('Afficher les infos détaillées de cette adresse IP.')
+            lookup_action.triggered.connect(lambda _checked=False, ip_address=selected_ips[0]: show_detailed_ip_lookup(self, ip_address))
+            menu.addAction(lookup_action)
+
+            # pylint: disable=duplicate-code
+            ping_menu = QMenu('Ping', menu)
+            ping_menu.setIcon(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')))
+            ping_menu.setStyleSheet(SVG_ICON_CONTEXT_MENU_STYLESHEET)
+            ping_menu.setToolTipsVisible(True)
+
+            normal_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Normal (ICMP)', self)
+            normal_action.setToolTip("Vérifie si l'adresse IP sélectionnée répond aux pings.")
+            normal_action.triggered.connect(lambda _checked=False, ip_address=selected_ips[0]: ping_ip(ip_address))
+            ping_menu.addAction(normal_action)
+
+            tcp_ping_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Ping de port TCP', self)
+            tcp_ping_action.setToolTip("Vérifie si l'adresse IP sélectionnée répond aux pings TCP sur un port donné.")
+            tcp_ping_action.triggered.connect(lambda _checked=False, ip_address=selected_ips[0]: tcp_port_ping(self, ip_address))
+            ping_menu.addAction(tcp_ping_action)
+
+            udp_ping_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Ping de port UDP', self)
+            udp_ping_action.setToolTip("Vérifie si l'adresse IP sélectionnée répond aux pings UDP sur un port donné.")
+            udp_ping_action.triggered.connect(lambda _checked=False, ip_address=selected_ips[0]: udp_port_ping(self, ip_address))
+            ping_menu.addAction(udp_ping_action)
+
+            web_ping_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Web (Check-Host)', self)
+            web_ping_action.setToolTip("Vérifie si l'adresse IP sélectionnée répond via les serveurs de Check-Host.net.")
+            web_ping_action.triggered.connect(lambda _checked=False, ip_address=selected_ips[0]: web_ping(ip_address))
+            ping_menu.addAction(web_ping_action)
+
+            menu.addMenu(ping_menu)
+            # pylint: enable=duplicate-code
+
+        elif len(selected_ips) > 1:
+            menu.addSeparator()
+            _target_ips = list(selected_ips)
+
+            # pylint: disable=duplicate-code
+            ping_menu = QMenu('Ping', menu)
+            ping_menu.setIcon(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')))
+            ping_menu.setStyleSheet(SVG_ICON_CONTEXT_MENU_STYLESHEET)
+            ping_menu.setToolTipsVisible(True)
+
+            normal_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Normal (ICMP)', self)
+            normal_action.setToolTip('Vérifie si les adresses IP sélectionnées répondent aux pings.')
+
+            def _ping_all_csv() -> None:
+                ping_ip(_target_ips)
+
+            normal_action.triggered.connect(_ping_all_csv)
+            ping_menu.addAction(normal_action)
+
+            create_multi_tcp_ping_menu(self, _target_ips, ping_menu)
+            create_multi_udp_ping_menu(self, _target_ips, ping_menu)
+
+            web_ping_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Web (Check-Host)', self)
+            web_ping_action.setToolTip('Vérifie si les adresses IP sélectionnées répondent via les serveurs de Check-Host.net.')
+
+            def _web_ping_all_csv() -> None:
+                web_ping(_target_ips)
+
+            web_ping_action.triggered.connect(_web_ping_all_csv)
+            ping_menu.addAction(web_ping_action)
+            menu.addMenu(ping_menu)
+
+            scan_ports_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'port_scanner.svg')), 'Scanner les ports…', menu)
+            scan_ports_action.setToolTip('Scanner les ports TCP et UDP des hôtes sélectionnés.')
+
+            def _scan_all_csv() -> None:
+                scan_ports_ip(_target_ips)
+
+            scan_ports_action.triggered.connect(_scan_all_csv)
+            menu.addAction(scan_ports_action)
+
+        menu.addSeparator()
+
+        delete_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')), 'Supprimer les lignes sélectionnées', menu)
+        delete_action.setToolTip('Supprimer définitivement les lignes sélectionnées du fichier de log.')
+        delete_action.setEnabled(has_selection)
+        delete_action.triggered.connect(self._delete_selected_rows)
+        menu.addAction(delete_action)
+
+        viewport = self._table.viewport()
+        if viewport:
+            menu.popup(viewport.mapToGlobal(pos))
+
+    def _get_selected_ips(self, index: QModelIndex, selection_model: QItemSelectionModel | None) -> list[str]:
+        """Extract unique IPv4 addresses from current table selection or clicked row."""
+        selected_ips: list[str] = []
+        if selection_model:
+            for selected_model_index in selection_model.selectedRows():
+                source_model_index = self._proxy.mapToSource(selected_model_index)
+                self._extract_ips_from_row(source_model_index.row(), selected_ips)
+
+        if not selected_ips and index.isValid():
+            source_index = self._proxy.mapToSource(index)
+            self._extract_ips_from_row(source_index.row(), selected_ips)
+
+        return selected_ips
+
+    def _extract_ips_from_row(self, row: int, target_list: list[str]) -> None:
+        """Helper to scan columns of *row* for IPv4 strings and append to *target_list*."""
+        for column_index in range(self._model.columnCount()):
+            item = self._model.item(row, column_index)
+            if item and item.text():
+                cell_text = item.text().strip()
+                try:
+                    IPv4Address(cell_text)
+                    if cell_text not in target_list:
+                        target_list.append(cell_text)
+                except ValueError:
+                    pass
+
+    def _toggle_column_visibility(self, checked: bool) -> None:  # noqa: FBT001
+        action = self.sender()
+        if isinstance(action, QAction):
+            column = action.data()
+            self._table.setColumnHidden(column, not checked)
+            self._reset_column_sizes()
+
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
+
+    def _copy_selected(self) -> None:
+        selection_model = self._table.selectionModel()
+        if not selection_model:
+            return
+        indexes = selection_model.selectedRows()
+        if not indexes:
+            return
+        lines: list[str] = []
+        column_count = self._model.columnCount()
+        for model_index in sorted(indexes, key=lambda index: index.row()):
+            source_row = self._proxy.mapToSource(model_index).row()
+            cells: list[str] = []
+            for column in range(column_count):
+                item = self._model.item(source_row, column)
+                cells.append(item.text() if item else '')
+            lines.append(','.join(cells))
+
+        set_clipboard_text('\n'.join(lines))
+
+    def _copy_all(self) -> None:
+        lines: list[str] = []
+        column_count = self._model.columnCount()
+        row_count = self._proxy.rowCount()
+        for row_index in range(row_count):
+            source_row = self._proxy.mapToSource(self._proxy.index(row_index, 0)).row()
+            cells: list[str] = []
+            for column_index in range(column_count):
+                item = self._model.item(source_row, column_index)
+                cells.append(item.text() if item else '')
+            lines.append(','.join(cells))
+
+        if not lines:
+            return
+
+        set_clipboard_text('\n'.join(lines))
+
+    def _export_as(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            'Export Log As',
+            str(self._file_path.with_suffix('.export.csv')),
+            'CSV Files (*.csv);;All Files (*)',
+        )
+        if not path:
+            return
+        shutil.copy2(self._file_path, path)
+        self._show_status(f'Exporté dans {path}')
+
+    def _delete_selected_rows(self) -> None:
+        selection_model = self._table.selectionModel()
+        if not selection_model:
+            return
+        indexes = selection_model.selectedRows()
+        if not indexes:
+            QMessageBox.information(self, TITLE, 'Aucune ligne sélectionnée.')
+            return
+        count = len(indexes)
+        reply = QMessageBox.question(
+            self,
+            TITLE,
+            f'Supprimer {count} ligne{pluralize(count)} sélectionnée{pluralize(count)} de {self._file_path.name} ?\n\nImpossible d\'annuler.',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        source_rows = sorted((self._proxy.mapToSource(i).row() for i in indexes), reverse=True)
+        for row in source_rows:
+            self._model.removeRow(row)
+
+        self._rewrite_csv_from_model()
+        self._update_counts()
+        self._metadata_label.setText(file_metadata_text(self._file_path))
+
+    def _purge_file(self) -> None:
+        message = purge_log_file(self, self._file_path, item_label='entries')
+        if message is not None:
+            self._show_status(message)
+            self.load_data()
+
+    def _rewrite_csv_from_model(self) -> None:
+        """Rewrite the CSV file from the current model contents."""
+        headers = [self._model.headerData(i, Qt.Orientation.Horizontal) for i in range(self._model.columnCount())]
+        with self._file_path.open('w', newline='', encoding='utf-8') as file:
+            writer = csv.writer(file)
+            writer.writerow(headers)
+            for row_index in range(self._model.rowCount()):
+                cells: list[str] = []
+                for column in range(self._model.columnCount()):
+                    item = self._model.item(row_index, column)
+                    cells.append(item.text() if item else '')
+                writer.writerow(cells)
+
+    def _show_status(self, message: str) -> None:
+        QMessageBox.information(self, TITLE, message)

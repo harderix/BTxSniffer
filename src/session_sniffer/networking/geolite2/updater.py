@@ -1,0 +1,329 @@
+"""GeoLite2 database updater (download and persist)."""
+
+import hashlib
+import logging
+import tempfile
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from threading import Thread
+from typing import TYPE_CHECKING, Literal
+
+import requests
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from session_sniffer import msgbox
+from session_sniffer.constants.local import GEOLITE2_DATABASES_DIR_PATH
+from session_sniffer.constants.standalone import TITLE
+from session_sniffer.error_messages import format_geolite2_download_flags_failed_message
+from session_sniffer.models import GithubReleaseResponse
+from session_sniffer.models.player_traffic import PlayerBandwidth
+from session_sniffer.networking.http_session import session
+from session_sniffer.text_utils import format_triple_quoted_text
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+GITHUB_RELEASE_API__GEOLITE2__URL = 'https://api.github.com/repos/P3TERX/GeoLite.mmdb/releases/latest'
+_PROGRESS_THROTTLE_SECONDS = 0.08
+_UNKNOWN_TOTAL_PROGRESS_THROTTLE_SECONDS = 0.2
+_PERCENTAGE_COMPLETE = 100
+
+logger = logging.getLogger(__name__)
+
+
+class GeoLite2VersionEntry(BaseModel):
+    """Represents a single GeoLite2 database version entry."""
+
+    version: datetime
+
+
+class GeoLite2VersionFile(BaseModel):
+    """Represents the full GeoLite2 version file."""
+
+    GeoLite2_ASN: GeoLite2VersionEntry = Field(
+        validation_alias='GeoLite2-ASN.mmdb',
+        serialization_alias='GeoLite2-ASN.mmdb',
+    )
+    GeoLite2_City: GeoLite2VersionEntry = Field(
+        validation_alias='GeoLite2-City.mmdb',
+        serialization_alias='GeoLite2-City.mmdb',
+    )
+    GeoLite2_Country: GeoLite2VersionEntry = Field(
+        validation_alias='GeoLite2-Country.mmdb',
+        serialization_alias='GeoLite2-Country.mmdb',
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+@dataclass(kw_only=True, slots=True)
+class GeoLite2UpdateResult:
+    """Outcome of a GeoLite2 update attempt (success or failure)."""
+
+    exception: Exception | None = None
+    url: str | None = None
+    http_code: int | str | None = None
+
+
+@dataclass(kw_only=True, slots=True)
+class GeoLite2DatabaseInfo:
+    """Mutable state for a single GeoLite2 database file."""
+
+    current_version: str | None = None
+    last_version: str | None = None
+    download_url: str | None = None
+
+    def set_current_version_from_datetime(self, dt: datetime) -> None:
+        """Set current_version from a datetime object, storing ISO string."""
+        self.current_version = dt.isoformat()
+
+    def apply_release_asset(self, *, updated_at: datetime, download_url: str) -> None:
+        """Update last version and download URL together."""
+        self.last_version = updated_at.isoformat()
+        self.download_url = download_url
+
+
+GeoLite2DatabaseKey = Literal['GeoLite2-ASN.mmdb', 'GeoLite2-City.mmdb', 'GeoLite2-Country.mmdb']
+GeoLite2Databases = dict[GeoLite2DatabaseKey, GeoLite2DatabaseInfo]
+GEOLITE2_DATABASE_NAMES: tuple[GeoLite2DatabaseKey, ...] = ('GeoLite2-ASN.mmdb', 'GeoLite2-City.mmdb', 'GeoLite2-Country.mmdb')
+
+
+def _build_geolite2_databases_state() -> GeoLite2Databases:
+    return {name: GeoLite2DatabaseInfo() for name in GEOLITE2_DATABASE_NAMES}
+
+
+def _as_geolite2_database_key(name: str, /) -> GeoLite2DatabaseKey | None:
+    for database_name in GEOLITE2_DATABASE_NAMES:
+        if name == database_name:
+            return database_name
+
+    return None
+
+
+def _load_geolite2_current_versions(*, geolite2_version_file_path: Path, geolite2_databases: GeoLite2Databases) -> None:
+    """Load current GeoLite2 database versions from disk into in-memory state."""
+    if not geolite2_version_file_path.is_file():
+        return
+    try:
+        version_file = GeoLite2VersionFile.model_validate_json(geolite2_version_file_path.read_text(encoding='utf-8'))
+    except (ValidationError, OSError):
+        logger.warning('Corrupted or invalid GeoLite2 JSON version file at %s, re-downloading databases', geolite2_version_file_path)
+        return
+
+    geolite2_databases['GeoLite2-ASN.mmdb'].set_current_version_from_datetime(version_file.GeoLite2_ASN.version)
+    geolite2_databases['GeoLite2-City.mmdb'].set_current_version_from_datetime(version_file.GeoLite2_City.version)
+    geolite2_databases['GeoLite2-Country.mmdb'].set_current_version_from_datetime(version_file.GeoLite2_Country.version)
+
+
+def _geolite2_update_result_from_exception(*, exception: requests.exceptions.RequestException, url: str) -> GeoLite2UpdateResult:
+    return GeoLite2UpdateResult(exception=exception, url=url, http_code=getattr(exception.response, 'status_code', None))
+
+
+def _fetch_geolite2_release_assets() -> tuple[GeoLite2UpdateResult, None] | tuple[None, GithubReleaseResponse]:
+    try:
+        response = session.get(GITHUB_RELEASE_API__GEOLITE2__URL, timeout=30)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        return _geolite2_update_result_from_exception(exception=e, url=GITHUB_RELEASE_API__GEOLITE2__URL), None
+
+    release_response_data = response.json()
+    release_data = GithubReleaseResponse.model_validate(release_response_data)
+
+    return None, release_data
+
+
+def _download_geolite2_asset_bytes(
+    download_url: str,
+    /,
+    *,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> tuple[GeoLite2UpdateResult | None, bytes | None]:
+    try:
+        response = session.get(download_url, stream=True, timeout=30)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        return _geolite2_update_result_from_exception(exception=e, url=download_url), None
+
+    total_bytes = int(response.headers.get('Content-Length', 0))
+    chunk_size = 65_536  # 64 KiB
+    downloaded_chunks: list[bytes] = []
+    downloaded_bytes = 0
+    last_reported_percentage = -1
+    last_reported_time = 0.0
+
+    if on_progress is not None and total_bytes > 0:
+        on_progress(0, total_bytes)
+
+    try:
+        for chunk in response.iter_content(chunk_size=chunk_size):
+            if not chunk:
+                continue
+            downloaded_chunks.append(chunk)
+            downloaded_bytes += len(chunk)
+
+            if on_progress is not None:
+                current_time = time.monotonic()
+                if total_bytes > 0:
+                    percentage = int((downloaded_bytes / total_bytes) * _PERCENTAGE_COMPLETE)
+                    if percentage != last_reported_percentage and (
+                        current_time - last_reported_time >= _PROGRESS_THROTTLE_SECONDS or percentage == _PERCENTAGE_COMPLETE
+                    ):
+                        last_reported_percentage = percentage
+                        last_reported_time = current_time
+                        on_progress(downloaded_bytes, total_bytes)
+                elif current_time - last_reported_time >= _UNKNOWN_TOTAL_PROGRESS_THROTTLE_SECONDS:
+                    last_reported_time = current_time
+                    on_progress(downloaded_bytes, total_bytes)
+    except requests.exceptions.RequestException as e:
+        return _geolite2_update_result_from_exception(exception=e, url=download_url), None
+
+    if on_progress is not None and total_bytes > 0 and last_reported_percentage != _PERCENTAGE_COMPLETE:
+        on_progress(downloaded_bytes, total_bytes)
+
+    return None, b''.join(downloaded_chunks)
+
+
+def _write_geolite2_version_file(geolite2_version_file_path: Path, geolite2_databases: GeoLite2Databases, /) -> None:
+    geolite2_version_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    asn_version = geolite2_databases['GeoLite2-ASN.mmdb'].current_version
+    city_version = geolite2_databases['GeoLite2-City.mmdb'].current_version
+    country_version = geolite2_databases['GeoLite2-Country.mmdb'].current_version
+    if not (asn_version and city_version and country_version):
+        return
+
+    version_file = GeoLite2VersionFile(
+        GeoLite2_ASN=GeoLite2VersionEntry(version=datetime.fromisoformat(asn_version)),
+        GeoLite2_City=GeoLite2VersionEntry(version=datetime.fromisoformat(city_version)),
+        GeoLite2_Country=GeoLite2VersionEntry(version=datetime.fromisoformat(country_version)),
+    )
+    geolite2_version_file_path.write_text(version_file.model_dump_json(indent=4, by_alias=True), encoding='utf-8')
+
+
+def _notify_geolite2_download_flags_failed(failed_flags: list[str], /) -> None:
+    if not failed_flags:
+        return
+
+    Thread(
+        target=msgbox.show,
+        name='GeoLite2DownloadError',
+        kwargs={
+            'title': TITLE,
+            'text': format_triple_quoted_text(
+                format_geolite2_download_flags_failed_message(failed_flags=failed_flags, geolite2_release_api_url=GITHUB_RELEASE_API__GEOLITE2__URL),
+            ),
+            'style': msgbox.Style.MB_OK | msgbox.Style.MB_ICONEXCLAMATION | msgbox.Style.MB_SYSTEMMODAL,
+        },
+        daemon=True,
+    ).start()
+
+
+def _persist_geolite2_database_bytes(*, database_name: str, file_bytes: bytes, desired_version: str, current_version: str | None) -> str | None:
+    GEOLITE2_DATABASES_DIR_PATH.mkdir(parents=True, exist_ok=True)
+    destination_file_path = GEOLITE2_DATABASES_DIR_PATH / database_name
+
+    if destination_file_path.is_file():
+        existing_size = destination_file_path.stat().st_size
+        new_size = len(file_bytes)
+
+        if (
+            existing_size == new_size
+            and hashlib.sha256(destination_file_path.read_bytes()).digest() == hashlib.sha256(file_bytes).digest()  # Only compare hashes if file sizes match
+        ):
+            return desired_version
+
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(file_bytes)
+            temp_path = Path(tmp.name)
+
+        try:
+            temp_path.replace(destination_file_path)
+        except PermissionError:
+            logger.exception('Failed to replace GeoLite2 database at %s', destination_file_path)
+            temp_path.unlink(missing_ok=True)
+            return current_version
+
+        return desired_version
+
+    destination_file_path.write_bytes(file_bytes)
+    return desired_version
+
+
+def update_geolite2_databases(*, progress_callback: Callable[[str], None] | None = None) -> GeoLite2UpdateResult:
+    """Download/update GeoLite2 ASN/City/Country mmdb databases and persist versions."""
+    geolite2_version_file_path = GEOLITE2_DATABASES_DIR_PATH / 'version.json'
+    geolite2_databases = _build_geolite2_databases_state()
+
+    _load_geolite2_current_versions(geolite2_version_file_path=geolite2_version_file_path, geolite2_databases=geolite2_databases)
+
+    update_error, release_data = _fetch_geolite2_release_assets()
+    if update_error is not None or release_data is None:
+        return update_error if update_error is not None else GeoLite2UpdateResult()
+
+    for asset in release_data.assets:
+        database_key = _as_geolite2_database_key(asset.name)
+        if database_key is None:
+            continue
+
+        geolite2_databases[database_key].apply_release_asset(
+            updated_at=asset.updated_at,
+            download_url=str(asset.browser_download_url),
+        )
+
+    databases_to_download: list[GeoLite2DatabaseKey] = [
+        database_name
+        for database_name, database_info in geolite2_databases.items()
+        if database_info.last_version and database_info.current_version != database_info.last_version and database_info.download_url
+    ]
+    total_databases = len(databases_to_download)
+    current_database_index = 0
+
+    failed_fetching_flag_list: list[str] = []
+    first_download_error: GeoLite2UpdateResult | None = None
+
+    for database_name, database_info in geolite2_databases.items():
+        if not database_info.last_version:
+            failed_fetching_flag_list.append(database_name)
+            continue
+
+        if database_info.current_version == database_info.last_version:
+            continue
+
+        if database_info.download_url is None:
+            failed_fetching_flag_list.append(database_name)
+            continue
+
+        current_database_index += 1
+
+        def _handle_chunk_progress(downloaded_bytes: int, total_bytes: int, name: str = database_name, index: int = current_database_index) -> None:
+            if progress_callback is None:
+                return
+            downloaded_formatted = PlayerBandwidth.format_bytes(downloaded_bytes)
+            prefix = f'{name} [{index}/{total_databases}]' if total_databases > 1 else name
+            if total_bytes > 0:
+                percentage = int((downloaded_bytes / total_bytes) * _PERCENTAGE_COMPLETE)
+                total_formatted = PlayerBandwidth.format_bytes(total_bytes)
+                progress_callback(f'{prefix}: {percentage}% - {downloaded_formatted} / {total_formatted}')
+            else:
+                progress_callback(f'{prefix}: {downloaded_formatted}')
+
+        download_error, file_bytes = _download_geolite2_asset_bytes(database_info.download_url, on_progress=_handle_chunk_progress)
+        if download_error is not None or file_bytes is None:
+            if first_download_error is None:
+                first_download_error = download_error if download_error is not None else GeoLite2UpdateResult()
+            failed_fetching_flag_list.append(database_name)
+            continue
+
+        database_info.current_version = _persist_geolite2_database_bytes(
+            database_name=database_name,
+            file_bytes=file_bytes,
+            desired_version=database_info.last_version,
+            current_version=database_info.current_version,
+        )
+
+    _notify_geolite2_download_flags_failed(failed_fetching_flag_list)
+    _write_geolite2_version_file(geolite2_version_file_path, geolite2_databases)
+
+    return first_download_error if first_download_error is not None else GeoLite2UpdateResult()

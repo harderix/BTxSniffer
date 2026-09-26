@@ -1,0 +1,255 @@
+"""Right-click Detections menu helpers for session tables."""
+
+from contextlib import suppress
+from typing import TYPE_CHECKING
+
+from PySide6.QtGui import QIcon
+
+from session_sniffer.constants.local import RESOURCES_DIR_PATH
+from session_sniffer.guis.detections_manager import open_combo_rule_editor, open_combo_rule_editor_for_player
+from session_sniffer.player.detections import GUIDetectionSettings
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from PySide6.QtGui import QAction
+    from PySide6.QtWidgets import QMenu, QWidget
+
+    from session_sniffer.models.player import Player
+
+_PLACEHOLDER = '...'
+
+
+def _toggle_detection_list(target_list: list[str], value: str, *, add: bool) -> None:
+    """Add or remove *value* from a GUIDetectionSettings list and persist."""
+    if add:
+        if value not in target_list:
+            target_list.append(value)
+    else:
+        with suppress(ValueError):
+            target_list.remove(value)
+    GUIDetectionSettings.save_to_settings()
+
+
+def _safe_str(value: str) -> str | None:
+    """Return `value` if it is a non-empty, non-placeholder string, else `None`."""
+    if value and value != _PLACEHOLDER:
+        return value
+    return None
+
+
+def build_detections_menu(
+    menu: QMenu,
+    add_action: Callable[..., QAction],
+    player: Player,
+    parent: QWidget,
+) -> None:
+    """Build a Detections submenu for a single player."""
+    country_name = _safe_str(player.iplookup.geolite2.country)
+    isp = _safe_str(player.iplookup.ipapi.isp)
+    as_name = _safe_str(player.iplookup.ipapi.as_name)
+    asn_geolite2 = _safe_str(player.iplookup.geolite2.asn)
+
+    # --- Country ---
+    if country_name:
+        country_in_list = country_name in GUIDetectionSettings.country_detection_list
+        if country_in_list:
+            add_action(
+                menu,
+                f'Retirer le pays ({country_name})',
+                tooltip=f'Retirer {country_name} de la liste de détection par pays.',
+                handler=lambda: _toggle_detection_list(GUIDetectionSettings.country_detection_list, country_name, add=False),
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')),
+            )
+        else:
+            add_action(
+                menu,
+                f'Ajouter le pays ({country_name})',
+                tooltip=f'Ajouter {country_name} à la liste de détection par pays.',
+                handler=lambda: _toggle_detection_list(GUIDetectionSettings.country_detection_list, country_name, add=True),
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'add.svg')),
+            )
+
+    # --- ISP ---
+    if isp:
+        isp_in_list = isp in GUIDetectionSettings.isp_detection_list
+        if isp_in_list:
+            add_action(
+                menu,
+                f'Retirer le FAI ({isp})',
+                tooltip=f'Retirer le FAI "{isp}" de la liste de détection par FAI.',
+                handler=lambda _isp=isp: _toggle_detection_list(GUIDetectionSettings.isp_detection_list, _isp, add=False),
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')),
+            )
+        else:
+            add_action(
+                menu,
+                f'Ajouter le FAI ({isp})',
+                tooltip=f'Ajouter le FAI "{isp}" à la liste de détection par FAI.',
+                handler=lambda _isp=isp: _toggle_detection_list(GUIDetectionSettings.isp_detection_list, _isp, add=True),
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'add.svg')),
+            )
+
+    # --- ASN ---
+    asn_value = as_name or asn_geolite2
+    if asn_value:
+        asn_in_list = asn_value in GUIDetectionSettings.asn_detection_list
+        if asn_in_list:
+            add_action(
+                menu,
+                f'Retirer l\'ASN ({asn_value})',
+                tooltip=f'Retirer l\'ASN "{asn_value}" de la liste de détection par ASN.',
+                handler=lambda: _toggle_detection_list(GUIDetectionSettings.asn_detection_list, asn_value, add=False),
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')),
+            )
+        else:
+            add_action(
+                menu,
+                f'Ajouter l\'ASN ({asn_value})',
+                tooltip=f'Ajouter l\'ASN "{asn_value}" à la liste de détection par ASN.',
+                handler=lambda: _toggle_detection_list(GUIDetectionSettings.asn_detection_list, asn_value, add=True),
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'add.svg')),
+            )
+
+    menu.addSeparator()
+    add_action(
+        menu,
+        'Créer une règle combinée...',
+        tooltip="Ouvrir l'éditeur de règles combinées pré-rempli avec le pays, le FAI et l'ASN de ce joueur.",
+        handler=lambda: open_combo_rule_editor_for_player(parent, player),
+        icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'link.svg')),
+    )
+
+
+def build_detections_menu_multi(
+    menu: QMenu,
+    add_action: Callable[..., QAction],
+    players: list[Player],
+    parent: QWidget,
+) -> None:
+    """Build a Detections submenu for multiple selected players."""
+    # Collect unique values from all players
+    countries: list[str] = sorted({country for player in players if (country := _safe_str(player.iplookup.geolite2.country))})
+    isps: list[str] = sorted({isp for player in players if (isp := _safe_str(player.iplookup.ipapi.isp))})
+    asns: list[str] = sorted({asn for player in players if (asn := _safe_str(player.iplookup.ipapi.as_name) or _safe_str(player.iplookup.geolite2.asn))})
+
+    has_items = False
+
+    # --- Country ---
+    new_countries = [country for country in countries if country not in GUIDetectionSettings.country_detection_list]
+    existing_countries = [country for country in countries if country in GUIDetectionSettings.country_detection_list]
+    if new_countries or existing_countries:
+        has_items = True
+    if new_countries:
+
+        def _add_countries(country_names: list[str] = new_countries) -> None:
+            for country_name in country_names:
+                if country_name not in GUIDetectionSettings.country_detection_list:
+                    GUIDetectionSettings.country_detection_list.append(country_name)
+            GUIDetectionSettings.save_to_settings()
+
+        add_action(
+            menu,
+            f'Ajouter {len(new_countries)} pays à la liste de détection',
+            tooltip=f'Ajouter {", ".join(new_countries)} à la liste de détection par pays.',
+            handler=_add_countries,
+            icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'add.svg')),
+        )
+    if existing_countries:
+
+        def _remove_countries(country_names: list[str] = existing_countries) -> None:
+            for country_name in country_names:
+                with suppress(ValueError):
+                    GUIDetectionSettings.country_detection_list.remove(country_name)
+            GUIDetectionSettings.save_to_settings()
+
+        add_action(
+            menu,
+            f'Retirer {len(existing_countries)} pays de la liste de détection',
+            tooltip=f'Retirer {", ".join(existing_countries)} de la liste de détection par pays.',
+            handler=_remove_countries,
+            icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')),
+        )
+
+    # --- ISP ---
+    new_isps = [isp for isp in isps if isp not in GUIDetectionSettings.isp_detection_list]
+    existing_isps = [isp for isp in isps if isp in GUIDetectionSettings.isp_detection_list]
+    if new_isps or existing_isps:
+        if has_items:
+            menu.addSeparator()
+        has_items = True
+    if new_isps:
+
+        def _add_isps(isp_list: list[str] = new_isps) -> None:
+            for isp in isp_list:
+                if isp not in GUIDetectionSettings.isp_detection_list:
+                    GUIDetectionSettings.isp_detection_list.append(isp)
+            GUIDetectionSettings.save_to_settings()
+
+        add_action(
+            menu,
+            f'Ajouter {len(new_isps)} FAI à la liste de détection',
+            tooltip=f'Ajouter {", ".join(new_isps)} à la liste de détection par FAI.',
+            handler=_add_isps,
+            icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'add.svg')),
+        )
+    if existing_isps:
+
+        def _remove_isps(isp_list: list[str] = existing_isps) -> None:
+            for isp in isp_list:
+                with suppress(ValueError):
+                    GUIDetectionSettings.isp_detection_list.remove(isp)
+            GUIDetectionSettings.save_to_settings()
+
+        add_action(
+            menu,
+            f'Retirer {len(existing_isps)} FAI de la liste de détection',
+            tooltip=f'Retirer {", ".join(existing_isps)} de la liste de détection par FAI.',
+            handler=_remove_isps,
+            icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')),
+        )
+
+    # --- ASN ---
+    new_asns = [asn for asn in asns if asn not in GUIDetectionSettings.asn_detection_list]
+    existing_asns = [asn for asn in asns if asn in GUIDetectionSettings.asn_detection_list]
+    if (new_asns or existing_asns) and has_items:
+        menu.addSeparator()
+    if new_asns:
+
+        def _add_asns(asn_list: list[str] = new_asns) -> None:
+            for asn in asn_list:
+                if asn not in GUIDetectionSettings.asn_detection_list:
+                    GUIDetectionSettings.asn_detection_list.append(asn)
+            GUIDetectionSettings.save_to_settings()
+
+        add_action(
+            menu,
+            f'Ajouter {len(new_asns)} ASN à la liste de détection',
+            tooltip=f'Ajouter {", ".join(new_asns)} à la liste de détection par ASN.',
+            handler=_add_asns,
+            icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'add.svg')),
+        )
+    if existing_asns:
+
+        def _remove_asns(asn_list: list[str] = existing_asns) -> None:
+            for asn in asn_list:
+                with suppress(ValueError):
+                    GUIDetectionSettings.asn_detection_list.remove(asn)
+            GUIDetectionSettings.save_to_settings()
+
+        add_action(
+            menu,
+            f'Retirer {len(existing_asns)} ASN de la liste de détection',
+            tooltip=f'Retirer {", ".join(existing_asns)} de la liste de détection par ASN.',
+            handler=_remove_asns,
+            icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')),
+        )
+
+    menu.addSeparator()
+    add_action(
+        menu,
+        'Créer une règle combinée...',
+        tooltip="Ouvrir l'éditeur de règles combinées pour créer une nouvelle règle.",
+        handler=lambda: open_combo_rule_editor(parent),
+        icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'link.svg')),
+    )

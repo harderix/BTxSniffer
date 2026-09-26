@@ -1,0 +1,63 @@
+"""SeenStatsDialog and show_seen_stats helper."""
+
+from typing import TYPE_CHECKING
+
+from PySide6.QtWidgets import (
+    QVBoxLayout,
+    QWidget,
+)
+
+from session_sniffer.constants.local import SESSIONS_LOGGING_DIR_PATH
+from session_sniffer.constants.standalone import TITLE
+from session_sniffer.guis.tables_player_actions._player_info_dialog_mixin import PlayerInfoDialogMixin
+from session_sniffer.guis.utils import (
+    ActiveDialogRegistry,
+    apply_adaptive_window_size,
+    format_player_display,
+    set_dialog_window_flags,
+)
+from session_sniffer.player.seen_stats import SEEN_STATS_LABELS, SeenStats, analyze_sessions_logging
+
+if TYPE_CHECKING:
+    from session_sniffer.models.player import Player
+
+
+class SeenStatsDialog(PlayerInfoDialogMixin):
+    """A dialog showing historical encounter statistics for a player IP."""
+
+    def __init__(self, parent: QWidget | None, player: Player) -> None:
+        """Compute seen stats and build the dialog UI."""
+        super().__init__(parent)
+        set_dialog_window_flags(self)
+        stats = analyze_sessions_logging(SESSIONS_LOGGING_DIR_PATH, player.ip)
+
+        self.setWindowTitle(f'{TITLE} - Stats de rencontre ({format_player_display(player.ip, player.usernames)})')
+        apply_adaptive_window_size(self, min_size=(380, 280), size_1080p=(500, 340), size_720p=(460, 320))
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(10, 10, 10, 10)
+        outer_layout.setSpacing(8)
+
+        self._add_header_label(outer_layout, f'Seen Stats — {format_player_display(player.ip, player.usernames)}', '#6940c7', '#9d74f0')
+
+        scroll_layout = self._init_scroll_area(outer_layout)
+
+        self._build_encounter_group(scroll_layout, stats)
+        scroll_layout.addStretch(1)
+
+        self._add_close_button_box(outer_layout)
+
+    def _build_encounter_group(self, parent_layout: QVBoxLayout, stats: SeenStats) -> None:
+        """Add the 'Session Encounters' section to the scroll layout."""
+        group, form = self._make_group('Rencontres en session', accent='#6940c7')
+        for key, label in SEEN_STATS_LABELS.items():
+            self._add_row(form, label, str(getattr(stats, key)))
+        parent_layout.addWidget(group)
+
+
+_active_dialogs: ActiveDialogRegistry[str, SeenStatsDialog] = ActiveDialogRegistry()
+
+
+def show_seen_stats(parent: QWidget | None, player: Player) -> None:
+    """Open or focus the Seen Stats dialog for *player*."""
+    _active_dialogs.show_or_focus(player.ip, lambda: SeenStatsDialog(parent, player))

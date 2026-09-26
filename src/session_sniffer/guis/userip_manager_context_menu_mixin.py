@@ -1,0 +1,732 @@
+"""Entries context-menu mixin for the UserIP Databases Manager dialog."""
+
+from ipaddress import IPv4Address
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from PySide6.QtCore import QItemSelectionModel, QModelIndex, QPoint, Qt, QUrl
+from PySide6.QtGui import QAction, QDesktopServices, QIcon, QStandardItemModel
+from PySide6.QtWidgets import QCheckBox, QDialog, QFileSystemModel, QMenu, QPushButton, QTreeView
+
+from session_sniffer.constants.local import RESOURCES_DIR_PATH, USERIP_DATABASES_DIR_PATH
+from session_sniffer.guis.looky_text import (
+    configure_looky_action,
+)
+from session_sniffer.guis.stylesheets import SVG_ICON_CONTEXT_MENU_STYLESHEET
+from session_sniffer.guis.tables_player_actions import (
+    create_multi_tcp_ping_menu,
+    create_multi_udp_ping_menu,
+    ping_ip,
+    scan_ports_ip,
+    show_detailed_ip_lookup,
+    tcp_port_ping,
+    udp_port_ping,
+    web_ping,
+)
+from session_sniffer.guis.tables_player_actions.looky_system._looky_refresh_userip import looky_refresh_userip_entries
+from session_sniffer.guis.userip_manager_helpers import (
+    DATABASE_COLUMN,
+    RANGE_COLUMN,
+    RE_USERIP_INI_PARSER_PATTERN,
+    SECTION_USERIP,
+    USERNAME_COLUMN,
+    EntriesSortProxy,
+    handle_ini_section_header,
+    populate_userip_databases_menu,
+)
+from session_sniffer.guis.utils import set_clipboard_text
+from session_sniffer.settings.settings import Settings
+from session_sniffer.text_utils import pluralize
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+class EntriesContextMenuMixin(QDialog):
+    """Mixin providing entries-table context menu and related navigation helpers.
+
+    Expects these attributes on the concrete class:
+        _entries_table, _proxy, _model, _global_search_active, _current_path,
+        _global_search_checkbox, _open_db_button, _tree, _fs_model
+    And these methods:
+        _add_entry, _insert_entry_at, _move_rows, _get_row_entry_value,
+        _load_database, _open_in_explorer, _delete_selected
+    """
+
+    # -- Attribute stubs for type checkers --
+    _entries_table: QTreeView
+    _proxy: EntriesSortProxy
+    _model: QStandardItemModel
+    _global_search_active: bool
+    _current_path: Path | None
+    _global_search_checkbox: QCheckBox
+    _open_db_button: QPushButton
+    _tree: QTreeView
+    _fs_model: QFileSystemModel
+    _open_in_explorer: Callable[[Path], None]
+
+    def _add_entry(self) -> None: ...
+
+    def _delete_selected(self) -> None: ...
+
+    def _reset_column_sizes(self) -> None: ...
+
+    def _edit_entry_ip(self, source_row: int) -> None: ...  # pylint: disable=unused-argument
+
+    def _insert_entry_at(self, source_row: int) -> None: ...  # pylint: disable=unused-argument
+
+    def _move_rows(self, proxy_index: QModelIndex, direction: int) -> None: ...  # pylint: disable=unused-argument
+
+    def _get_row_entry_value(self, row: int) -> str:  # pylint: disable=unused-argument  # noqa: ARG002
+        return ''
+
+    def _load_database(self, path: Path) -> None: ...  # pylint: disable=unused-argument
+
+    def _move_selected_to_database(self, target_db_path: Path) -> None: ...  # pylint: disable=unused-argument
+
+    def _update_entry_counts(self) -> None: ...
+
+    # ------------------------------------------------------------------
+    # Entries: context menu
+    # ------------------------------------------------------------------
+
+    def show_entries_context_menu(self, position: QPoint) -> None:
+        """Show a right-click context menu for the entries table."""
+        menu = QMenu(self)
+        menu.setStyleSheet(SVG_ICON_CONTEXT_MENU_STYLESHEET)
+        index = self._entries_table.indexAt(position)
+
+        selection_model = self._entries_table.selectionModel()
+        if selection_model and index.isValid() and not selection_model.isSelected(index):
+            selection_model.select(index, QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows)
+
+        if self._global_search_active:
+            if not index.isValid():
+                return
+            self._build_global_search_context_menu(menu, index)
+        else:
+            if self._current_path is None:
+                return
+            if index.isValid():
+                self._build_entry_context_menu(menu, index)
+            else:
+                add_top_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'menu_arrow_up.svg')), 'Ajouter une entrée en haut', self)
+                add_top_action.triggered.connect(lambda: self._insert_entry_at(0))
+                menu.addAction(add_top_action)
+
+                add_end_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'menu_arrow_down.svg')), 'Ajouter une entrée en bas', self)
+                add_end_action.triggered.connect(self._add_entry)
+                menu.addAction(add_end_action)
+
+        if menu.isEmpty():
+            return
+
+        viewport = self._entries_table.viewport()
+        if viewport:
+            menu.popup(viewport.mapToGlobal(position))
+
+    def _build_entry_context_menu(self, menu: QMenu, index: QModelIndex) -> None:
+        """Populate context menu actions for a single entry row in normal editing mode."""
+        source_index = self._proxy.mapToSource(index)
+        row = source_index.row()
+        username_item = self._model.item(row, USERNAME_COLUMN)
+        username = username_item.text() if username_item else ''
+        ip_or_range = self._get_row_entry_value(row)
+
+        selected_rows = self._entries_table.selectionModel().selectedRows() if self._entries_table.selectionModel() else []
+        selected_count = len(selected_rows) if selected_rows else 1
+
+        copy_row_label = f'Copier les lignes ({selected_count})' if selected_count > 1 else 'Copier la ligne'
+        copy_row_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), copy_row_label, self)
+        copy_row_action.setShortcut('Ctrl+C')
+        copy_row_action.setToolTip('Copier les lignes sélectionnées (texte séparé par tabulations).')
+        copy_row_action.triggered.connect(self._copy_selected_entries)
+        menu.addAction(copy_row_action)
+
+        copy_all_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), 'Tout copier', self)
+        copy_all_action.setToolTip('Copier toutes les entrées visibles (texte séparé par tabulations).')
+        copy_all_action.setEnabled(self._proxy.rowCount() > 0)
+        copy_all_action.triggered.connect(self._copy_all_entries)
+        menu.addAction(copy_all_action)
+
+        menu.addSeparator()
+
+        if selected_count <= 1:
+            if username:
+                copy_user_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), 'Copier le pseudo', self)
+                copy_user_action.triggered.connect(lambda: set_clipboard_text(username))
+                menu.addAction(copy_user_action)
+            if ip_or_range:
+                range_item = self._model.item(row, RANGE_COLUMN)
+                label = 'Range' if range_item and range_item.text().strip() else 'IP'
+                copy_ip_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), f'Copier {label}', self)
+                copy_ip_action.triggered.connect(lambda: set_clipboard_text(ip_or_range))
+                menu.addAction(copy_ip_action)
+        else:
+            all_usernames: list[str] = []
+            all_ips_or_ranges: list[str] = []
+            for sel_index in selected_rows:
+                src_idx = self._proxy.mapToSource(sel_index)
+                u_item = self._model.item(src_idx.row(), USERNAME_COLUMN)
+                if u_item and u_item.text():
+                    all_usernames.append(u_item.text())
+                val = self._get_row_entry_value(src_idx.row())
+                if val:
+                    all_ips_or_ranges.append(val)
+
+            if all_usernames:
+                copy_users_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), f'Copier les pseudos ({len(all_usernames)})', self)
+                copy_users_action.triggered.connect(lambda: set_clipboard_text('\n'.join(all_usernames)))
+                menu.addAction(copy_users_action)
+            if all_ips_or_ranges:
+                copy_ips_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), f'Copier les IP / plages ({len(all_ips_or_ranges)})', self)
+                copy_ips_action.triggered.connect(lambda: set_clipboard_text('\n'.join(all_ips_or_ranges)))
+                menu.addAction(copy_ips_action)
+
+        menu.addSeparator()
+
+        select_all_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'select_all.svg')), 'Tout sélectionner', self)
+        select_all_action.setShortcut('Ctrl+A')
+        select_all_action.setToolTip('Sélectionner toutes les lignes de la base.')
+        select_all_action.setEnabled(self._proxy.rowCount() > 0)
+        select_all_action.triggered.connect(self._entries_table.selectAll)
+        menu.addAction(select_all_action)
+
+        clear_selection_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'unselect_all.svg')), 'Effacer la sélection', self)
+        clear_selection_action.setToolTip('Désélectionner toutes les lignes sélectionnées.')
+        clear_selection_action.triggered.connect(self._entries_table.clearSelection)
+        menu.addAction(clear_selection_action)
+
+        menu.addSeparator()
+
+        # Single IP check & Multi-selected IPs detection
+        is_single_ip = False
+        if ip_or_range:
+            try:
+                IPv4Address(ip_or_range)
+                is_single_ip = True
+            except ValueError:
+                is_single_ip = False
+
+        selected_ips: list[str] = []
+        if self._entries_table.selectionModel():
+            for sel_index in self._entries_table.selectionModel().selectedRows():
+                src_idx = self._proxy.mapToSource(sel_index)
+                ip_val = self._get_row_entry_value(src_idx.row())
+                try:
+                    IPv4Address(ip_val)
+                    if ip_val not in selected_ips:
+                        selected_ips.append(ip_val)
+                except ValueError:
+                    pass
+
+        source_row = self._proxy.mapToSource(index).row()
+
+        if source_row > 0:
+            move_up_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'menu_arrow_up.svg')), 'Monter', self)
+            move_up_action.triggered.connect(lambda: self._move_rows(index, -1))
+            menu.addAction(move_up_action)
+        if source_row < self._model.rowCount() - 1:
+            move_down_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'menu_arrow_down.svg')), 'Descendre', self)
+            move_down_action.triggered.connect(lambda: self._move_rows(index, 1))
+            menu.addAction(move_down_action)
+
+        if source_row > 0 or source_row < self._model.rowCount() - 1:
+            menu.addSeparator()
+
+        insert_above_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'menu_arrow_up.svg')), 'Insérer une entrée au-dessus', self)
+        insert_above_action.triggered.connect(lambda: self._insert_entry_at(source_row))
+        menu.addAction(insert_above_action)
+
+        insert_below_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'menu_arrow_down.svg')), 'Insérer une entrée en dessous', self)
+        insert_below_action.triggered.connect(lambda: self._insert_entry_at(source_row + 1))
+        menu.addAction(insert_below_action)
+
+        menu.addSeparator()
+
+        add_top_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'menu_arrow_up.svg')), 'Ajouter une entrée en haut', self)
+        add_top_action.triggered.connect(lambda: self._insert_entry_at(0))
+        menu.addAction(add_top_action)
+
+        add_end_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'menu_arrow_down.svg')), 'Ajouter une entrée en bas', self)
+        add_end_action.triggered.connect(self._add_entry)
+        menu.addAction(add_end_action)
+
+        menu.addSeparator()
+
+        edit_ip_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'edit.svg')), 'Modifier IP/plage…', self)
+        edit_ip_action.triggered.connect(lambda: self._edit_entry_ip(source_row))
+        menu.addAction(edit_ip_action)
+
+        menu.addSeparator()
+
+        move_db_label = f'Déplacer la sélection vers une base ({selected_count})' if selected_count > 1 else 'Déplacer vers une base'
+        move_db_menu = QMenu(move_db_label, menu)
+        move_db_menu.setIcon(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'move_box.svg')))
+        move_db_menu.setStyleSheet(SVG_ICON_CONTEXT_MENU_STYLESHEET)
+        move_db_menu.setToolTipsVisible(True)
+        all_db_paths = [ini_path for ini_path in USERIP_DATABASES_DIR_PATH.rglob('*.ini') if ini_path.is_file()]
+        enabled_target_count = populate_userip_databases_menu(
+            move_db_menu,
+            all_db_paths,
+            tooltip=f'Déplacer les {pluralize(selected_count, "entry", "entries")} sélectionné(s) vers cette base.',
+            handler_factory=lambda target_path: lambda: self._move_selected_to_database(target_path),
+            disabled_path=self._current_path,
+        )
+        if not enabled_target_count:
+            move_db_menu.setEnabled(False)
+            move_db_menu.setToolTip('Aucune autre base disponible.')
+        menu.addMenu(move_db_menu)
+
+        # Network / Ping & Lookup actions
+        if is_single_ip or len(selected_ips) > 1:
+            menu.addSeparator()
+
+            if is_single_ip and len(selected_ips) <= 1:
+                _ip_target = ip_or_range
+                lookup_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'info.svg')), "Détails de l'IP…", self)
+                lookup_action.triggered.connect(lambda _checked=False, ip_address=_ip_target: show_detailed_ip_lookup(self, ip_address))
+                menu.addAction(lookup_action)
+
+            ping_menu = QMenu('Ping', menu)
+            ping_menu.setIcon(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')))
+            ping_menu.setStyleSheet(SVG_ICON_CONTEXT_MENU_STYLESHEET)
+            ping_menu.setToolTipsVisible(True)
+
+            if len(selected_ips) > 1:
+                _ip_addresses_target = list(selected_ips)
+                normal_ping_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Normal (ICMP)', self)
+                normal_ping_action.setToolTip('Vérifie si les adresses IP sélectionnées répondent aux pings.')
+
+                def _do_normal_ping_multi() -> None:
+                    ping_ip(_ip_addresses_target)
+
+                normal_ping_action.triggered.connect(_do_normal_ping_multi)
+                ping_menu.addAction(normal_ping_action)
+
+                create_multi_tcp_ping_menu(self, _ip_addresses_target, ping_menu)
+                create_multi_udp_ping_menu(self, _ip_addresses_target, ping_menu)
+
+                web_ping_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Web (Check-Host)', self)
+                web_ping_action.setToolTip('Vérifie si les adresses IP sélectionnées répondent via les serveurs de Check-Host.net.')
+
+                def _do_web_ping_multi() -> None:
+                    web_ping(_ip_addresses_target)
+
+                web_ping_action.triggered.connect(_do_web_ping_multi)
+                ping_menu.addAction(web_ping_action)
+            else:
+                _ip_target = ip_or_range
+                normal_ping_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Normal (ICMP)', self)
+                normal_ping_action.setToolTip("Vérifie si l'adresse IP sélectionnée répond aux pings.")
+                normal_ping_action.triggered.connect(lambda _checked=False, ip_address=_ip_target: ping_ip(ip_address))
+                ping_menu.addAction(normal_ping_action)
+
+                tcp_ping_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Ping de port TCP', self)
+                tcp_ping_action.setToolTip("Vérifie si l'adresse IP sélectionnée répond aux pings TCP sur un port donné.")
+                tcp_ping_action.triggered.connect(lambda _checked=False, ip_address=_ip_target: tcp_port_ping(self, ip_address))
+                ping_menu.addAction(tcp_ping_action)
+
+                udp_ping_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Ping de port UDP', self)
+                udp_ping_action.setToolTip("Vérifie si l'adresse IP sélectionnée répond aux pings UDP sur un port donné.")
+                udp_ping_action.triggered.connect(lambda _checked=False, ip_address=_ip_target: udp_port_ping(self, ip_address))
+                ping_menu.addAction(udp_ping_action)
+
+                web_ping_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Web (Check-Host)', self)
+                web_ping_action.setToolTip("Vérifie si l'adresse IP sélectionnée répond via les serveurs de Check-Host.net.")
+                web_ping_action.triggered.connect(lambda _checked=False, ip_address=_ip_target: web_ping(ip_address))
+                ping_menu.addAction(web_ping_action)
+
+            menu.addMenu(ping_menu)
+
+            scan_ports_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'port_scanner.svg')), 'Scanner les ports…', self)
+            scan_ports_action.setToolTip('Scanner les ports TCP et UDP des hôtes sélectionnés.')
+            scan_target = list(selected_ips) if len(selected_ips) > 1 else ip_or_range
+            scan_ports_action.triggered.connect(lambda _checked=False, target=scan_target: scan_ports_ip(target))
+            menu.addAction(scan_ports_action)
+
+        # Looky System refresh (only for single IPs in GTA5 feature set)
+        if ip_or_range and self._current_path is not None and Settings.is_gta5_feature_set() and is_single_ip:
+            menu.addSeparator()
+            refresh_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'eye.svg')), 'Ajouter des pseudos (Looky System)', self)
+            refresh_action.triggered.connect(
+                lambda _checked=False, database_path=self._current_path, target_ip=ip_or_range: looky_refresh_userip_entries(self, [(database_path, [target_ip])])
+            )
+            configure_looky_action(refresh_action, 'Look up this IP via Looky System and add any new usernames to its UserIP database.')
+            menu.addAction(refresh_action)
+
+        selected_count = len(self._entries_table.selectionModel().selectedRows()) if self._entries_table.selectionModel() else 1
+        delete_label = 'Supprimer la ou les lignes sélectionnées'
+        delete_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')), delete_label, self)
+        delete_action.triggered.connect(self._delete_selected)
+        menu.addSeparator()
+        menu.addAction(delete_action)
+
+    def _build_global_search_context_menu(self, menu: QMenu, index: QModelIndex) -> None:
+        """Populate context menu actions for a row in global search (read-only) mode."""
+        source_index = self._proxy.mapToSource(index)
+        row = source_index.row()
+        username_item = self._model.item(row, USERNAME_COLUMN)
+        db_item = self._model.item(row, DATABASE_COLUMN)
+        username = username_item.text() if username_item else ''
+        ip_or_range = self._get_row_entry_value(row)
+        db_path_str = db_item.data(Qt.ItemDataRole.UserRole) if db_item else None
+
+        # --- Copy actions ---
+        selected_rows_gs = self._entries_table.selectionModel().selectedRows() if self._entries_table.selectionModel() else []
+        selected_count_gs = len(selected_rows_gs) if selected_rows_gs else 1
+
+        copy_row_label = f'Copier les lignes ({selected_count_gs})' if selected_count_gs > 1 else 'Copier la ligne'
+        copy_row_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), copy_row_label, self)
+        copy_row_action.setShortcut('Ctrl+C')
+        copy_row_action.setToolTip('Copier les lignes sélectionnées (texte séparé par tabulations).')
+        copy_row_action.triggered.connect(self._copy_selected_entries)
+        menu.addAction(copy_row_action)
+
+        copy_all_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), 'Tout copier', self)
+        copy_all_action.setToolTip('Copier toutes les entrées visibles (texte séparé par tabulations).')
+        copy_all_action.setEnabled(self._proxy.rowCount() > 0)
+        copy_all_action.triggered.connect(self._copy_all_entries)
+        menu.addAction(copy_all_action)
+
+        menu.addSeparator()
+
+        if selected_count_gs <= 1:
+            if username:
+                copy_user_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), 'Copier le pseudo', self)
+                copy_user_action.triggered.connect(lambda: set_clipboard_text(username))
+                menu.addAction(copy_user_action)
+            if ip_or_range:
+                range_item = self._model.item(row, RANGE_COLUMN)
+                label = 'Range' if range_item and range_item.text().strip() else 'IP'
+                copy_ip_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), f'Copier {label}', self)
+                copy_ip_action.triggered.connect(lambda: set_clipboard_text(ip_or_range))
+                menu.addAction(copy_ip_action)
+        else:
+            all_usernames_gs: list[str] = []
+            all_ips_or_ranges_gs: list[str] = []
+            for sel_index in selected_rows_gs:
+                src_idx = self._proxy.mapToSource(sel_index)
+                u_item = self._model.item(src_idx.row(), USERNAME_COLUMN)
+                if u_item and u_item.text():
+                    all_usernames_gs.append(u_item.text())
+                val = self._get_row_entry_value(src_idx.row())
+                if val:
+                    all_ips_or_ranges_gs.append(val)
+
+            if all_usernames_gs:
+                copy_users_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), f'Copier les pseudos ({len(all_usernames_gs)})', self)
+                copy_users_action.triggered.connect(lambda: set_clipboard_text('\n'.join(all_usernames_gs)))
+                menu.addAction(copy_users_action)
+            if all_ips_or_ranges_gs:
+                copy_ips_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), f'Copier les IP / plages ({len(all_ips_or_ranges_gs)})', self)
+                copy_ips_action.triggered.connect(lambda: set_clipboard_text('\n'.join(all_ips_or_ranges_gs)))
+                menu.addAction(copy_ips_action)
+
+        menu.addSeparator()
+
+        select_all_gs_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'select_all.svg')), 'Tout sélectionner', self)
+        select_all_gs_action.setShortcut('Ctrl+A')
+        select_all_gs_action.setToolTip('Sélectionner toutes les lignes des résultats.')
+        select_all_gs_action.setEnabled(self._proxy.rowCount() > 0)
+        select_all_gs_action.triggered.connect(self._entries_table.selectAll)
+        menu.addAction(select_all_gs_action)
+
+        clear_selection_gs_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'unselect_all.svg')), 'Effacer la sélection', self)
+        clear_selection_gs_action.setToolTip('Désélectionner toutes les lignes sélectionnées.')
+        clear_selection_gs_action.triggered.connect(self._entries_table.clearSelection)
+        menu.addAction(clear_selection_gs_action)
+
+        menu.addSeparator()
+
+        # --- Database navigation actions ---
+        if db_path_str:
+            db_path = Path(db_path_str)
+
+            go_to_db_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'arrow_forward.svg')), 'Aller à la base', self)
+            go_to_db_action.triggered.connect(lambda: self._navigate_to_database(db_path, username=username, ip_or_range=ip_or_range))
+            menu.addAction(go_to_db_action)
+
+            open_editor_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'text_editor.svg')), "Ouvrir dans l'éditeur de texte", self)
+            open_editor_action.triggered.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(db_path))))
+            menu.addAction(open_editor_action)
+
+            open_explorer_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'folder.svg')), "Ouvrir dans l'explorateur", self)
+            open_explorer_action.triggered.connect(lambda: self._open_in_explorer(db_path))
+            menu.addAction(open_explorer_action)
+
+        menu.addSeparator()
+
+        move_gs_label = f'Déplacer la sélection vers une base ({selected_count_gs})' if selected_count_gs > 1 else 'Déplacer vers une base'
+        move_gs_menu = QMenu(move_gs_label, menu)
+        move_gs_menu.setIcon(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'move_box.svg')))
+        move_gs_menu.setStyleSheet(SVG_ICON_CONTEXT_MENU_STYLESHEET)
+        move_gs_menu.setToolTipsVisible(True)
+        all_db_paths_gs = [ini_path for ini_path in USERIP_DATABASES_DIR_PATH.rglob('*.ini') if ini_path.is_file()]
+        selected_db_paths = {
+            self._model.item(self._proxy.mapToSource(i).row(), DATABASE_COLUMN).data(Qt.ItemDataRole.UserRole)
+            for i in selected_rows_gs
+            if self._model.item(self._proxy.mapToSource(i).row(), DATABASE_COLUMN)
+        }
+        disabled_gs_path = Path(next(iter(selected_db_paths))) if len(selected_db_paths) == 1 and next(iter(selected_db_paths)) else None
+        enabled_target_count_gs = populate_userip_databases_menu(
+            move_gs_menu,
+            all_db_paths_gs,
+            tooltip=f'Déplacer les {pluralize(selected_count_gs, "entry", "entries")} sélectionné(s) vers cette base.',
+            handler_factory=lambda target_path: lambda: self._move_selected_to_database(target_path),
+            disabled_path=disabled_gs_path,
+        )
+        if not enabled_target_count_gs:
+            move_gs_menu.setEnabled(False)
+            move_gs_menu.setToolTip('Aucune autre base disponible.')
+        menu.addMenu(move_gs_menu)
+
+        # Single IP check & Multi-selected IPs detection for global search
+        is_single_ip_gs = False
+        if ip_or_range:
+            try:
+                IPv4Address(ip_or_range)
+                is_single_ip_gs = True
+            except ValueError:
+                is_single_ip_gs = False
+
+        selected_ips_gs: list[str] = []
+        if self._entries_table.selectionModel():
+            for sel_index in self._entries_table.selectionModel().selectedRows():
+                src_idx = self._proxy.mapToSource(sel_index)
+                ip_val = self._get_row_entry_value(src_idx.row())
+                try:
+                    IPv4Address(ip_val)
+                    if ip_val not in selected_ips_gs:
+                        selected_ips_gs.append(ip_val)
+                except ValueError:
+                    pass
+
+        # Network / Ping & Lookup actions
+        if is_single_ip_gs or len(selected_ips_gs) > 1:
+            menu.addSeparator()
+
+            if is_single_ip_gs and len(selected_ips_gs) <= 1:
+                _ip_gs = ip_or_range
+                lookup_gs_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'info.svg')), "Détails de l'IP…", self)
+                lookup_gs_action.triggered.connect(lambda _checked=False, ip_address=_ip_gs: show_detailed_ip_lookup(self, ip_address))
+                menu.addAction(lookup_gs_action)
+
+            ping_menu_gs = QMenu('Ping', menu)
+            ping_menu_gs.setIcon(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')))
+            ping_menu_gs.setStyleSheet(SVG_ICON_CONTEXT_MENU_STYLESHEET)
+            ping_menu_gs.setToolTipsVisible(True)
+
+            if len(selected_ips_gs) > 1:
+                _ip_addresses_gs = list(selected_ips_gs)
+                normal_ping_gs_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Normal (ICMP)', self)
+                normal_ping_gs_action.setToolTip('Vérifie si les adresses IP sélectionnées répondent aux pings.')
+
+                def _do_normal_ping_multi_gs() -> None:
+                    ping_ip(_ip_addresses_gs)
+
+                normal_ping_gs_action.triggered.connect(_do_normal_ping_multi_gs)
+                ping_menu_gs.addAction(normal_ping_gs_action)
+
+                create_multi_tcp_ping_menu(self, _ip_addresses_gs, ping_menu_gs)
+                create_multi_udp_ping_menu(self, _ip_addresses_gs, ping_menu_gs)
+
+                web_ping_gs_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Web (Check-Host)', self)
+                web_ping_gs_action.setToolTip('Vérifie si les adresses IP sélectionnées répondent via les serveurs de Check-Host.net.')
+
+                def _do_web_ping_multi_gs() -> None:
+                    web_ping(_ip_addresses_gs)
+
+                web_ping_gs_action.triggered.connect(_do_web_ping_multi_gs)
+                ping_menu_gs.addAction(web_ping_gs_action)
+            else:
+                _ip_gs = ip_or_range
+                normal_ping_gs_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Normal (ICMP)', self)
+                normal_ping_gs_action.setToolTip("Vérifie si l'adresse IP sélectionnée répond aux pings.")
+                normal_ping_gs_action.triggered.connect(lambda _checked=False, ip_address=_ip_gs: ping_ip(ip_address))
+                ping_menu_gs.addAction(normal_ping_gs_action)
+
+                tcp_ping_gs_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Ping de port TCP', self)
+                tcp_ping_gs_action.setToolTip("Vérifie si l'adresse IP sélectionnée répond aux pings TCP sur un port donné.")
+                tcp_ping_gs_action.triggered.connect(lambda _checked=False, ip_address=_ip_gs: tcp_port_ping(self, ip_address))
+                ping_menu_gs.addAction(tcp_ping_gs_action)
+
+                udp_ping_gs_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Ping de port UDP', self)
+                udp_ping_gs_action.setToolTip("Vérifie si l'adresse IP sélectionnée répond aux pings UDP sur un port donné.")
+                udp_ping_gs_action.triggered.connect(lambda _checked=False, ip_address=_ip_gs: udp_port_ping(self, ip_address))
+                ping_menu_gs.addAction(udp_ping_gs_action)
+
+                web_ping_gs_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')), 'Web (Check-Host)', self)
+                web_ping_gs_action.setToolTip("Vérifie si l'adresse IP sélectionnée répond via les serveurs de Check-Host.net.")
+                web_ping_gs_action.triggered.connect(lambda _checked=False, ip_address=_ip_gs: web_ping(ip_address))
+                ping_menu_gs.addAction(web_ping_gs_action)
+
+            menu.addMenu(ping_menu_gs)
+
+            scan_ports_gs_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'port_scanner.svg')), 'Scanner les ports…', self)
+            scan_ports_gs_action.setToolTip('Scanner les ports TCP et UDP des hôtes sélectionnés.')
+            scan_target_gs = list(selected_ips_gs) if len(selected_ips_gs) > 1 else ip_or_range
+            scan_ports_gs_action.triggered.connect(lambda _checked=False, target=scan_target_gs: scan_ports_ip(target))
+            menu.addAction(scan_ports_gs_action)
+
+        # Looky System refresh (only for single IPs in GTA5 feature set)
+        if db_path_str and username and ip_or_range and Settings.is_gta5_feature_set() and is_single_ip_gs:
+            _db_refresh = Path(db_path_str)
+            _ip_refresh = ip_or_range
+            menu.addSeparator()
+            refresh_gs_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'eye.svg')), 'Ajouter des pseudos (Looky System)', self)
+            refresh_gs_action.triggered.connect(
+                lambda _checked=False, database_path=_db_refresh, target_ip=_ip_refresh: looky_refresh_userip_entries(self, [(database_path, [target_ip])])
+            )
+            configure_looky_action(refresh_gs_action, 'Look up this IP via Looky System and add any new usernames to its UserIP database.')
+            menu.addAction(refresh_gs_action)
+
+        if username and ip_or_range:
+            selected_count = len(self._entries_table.selectionModel().selectedRows()) if self._entries_table.selectionModel() else 1
+            delete_label = 'Supprimer la ou les lignes sélectionnées'
+            delete_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')), delete_label, self)
+            delete_action.triggered.connect(self._delete_selected)
+            menu.addSeparator()
+            menu.addAction(delete_action)
+
+    def _delete_global_search_entry(self, db_path: Path, username: str, ip_or_range: str, source_row: int) -> None:
+        """Remove a single entry from the database file and from the search results table."""
+        content = db_path.read_text('utf-8')
+        lines = content.splitlines()
+        new_lines: list[str] = []
+        in_userip_section = False
+        removed = False
+
+        for raw_line in lines:
+            stripped = raw_line.strip()
+            is_header, in_userip_section = handle_ini_section_header(raw_line, stripped, new_lines, in_section=in_userip_section, section_name=SECTION_USERIP)
+            if is_header:
+                continue
+
+            if in_userip_section and not removed:
+                match = RE_USERIP_INI_PARSER_PATTERN.search(stripped)
+                if match:
+                    u_raw = match.group('username')
+                    ip_raw = match.group('ip')
+                    if u_raw is not None and ip_raw is not None and u_raw.strip() == username and ip_raw.strip() == ip_or_range:
+                        removed = True
+                        continue
+
+            new_lines.append(raw_line)
+
+        if not removed:
+            return
+
+        db_path.write_text('\n'.join(new_lines), encoding='utf-8')
+        self._model.removeRow(source_row)
+        self._update_entry_counts()
+
+    # pylint: disable=duplicate-code
+    def _copy_selected_entries(self) -> None:
+        """Copy selected rows from the UserIP entries table to the clipboard as tab-separated text."""
+        selection_model = self._entries_table.selectionModel()
+        if not selection_model:
+            return
+        selected_indexes = selection_model.selectedIndexes()
+        if not selected_indexes:
+            return
+
+        rows: dict[int, dict[int, str]] = {}
+        for model_index in selected_indexes:
+            if self._entries_table.isColumnHidden(model_index.column()):
+                continue
+            row_index = model_index.row()
+            column_index = model_index.column()
+            cell_data = model_index.data(Qt.ItemDataRole.DisplayRole)
+            rows.setdefault(row_index, {})[column_index] = str(cell_data) if cell_data is not None else ''
+
+        lines: list[str] = []
+        for row_index in sorted(rows):
+            column_map = rows[row_index]
+            lines.append('\t'.join(column_map[column_index] for column_index in sorted(column_map)))
+
+        if not lines:
+            return
+
+        set_clipboard_text('\n'.join(lines))
+
+    def _copy_all_entries(self) -> None:
+        """Copy all visible rows from the UserIP entries table to the clipboard as tab-separated text."""
+        lines: list[str] = []
+        column_count = self._proxy.columnCount()
+        row_count = self._proxy.rowCount()
+        for row_index in range(row_count):
+            cells: list[str] = []
+            for column_index in range(column_count):
+                if self._entries_table.isColumnHidden(column_index):
+                    continue
+                index = self._proxy.index(row_index, column_index)
+                cell_data = self._proxy.data(index, Qt.ItemDataRole.DisplayRole)
+                cells.append(str(cell_data) if cell_data is not None else '')
+            lines.append('\t'.join(cells))
+
+        if not lines:
+            return
+
+        set_clipboard_text('\n'.join(lines))
+    # pylint: enable=duplicate-code
+
+    def _navigate_to_database(self, db_path: Path, *, username: str = '', ip_or_range: str = '') -> None:
+        """Exit global search mode, open the given database, and select the matching entry when available."""
+        self._global_search_checkbox.setChecked(False)
+        self._current_path = db_path
+        self._load_database(db_path)
+        self._open_db_button.setEnabled(True)
+
+        # Select the database in the tree
+        tree_index = self._fs_model.index(str(db_path))
+        if tree_index.isValid():
+            selection = self._tree.selectionModel()
+            if selection:
+                selection.select(tree_index, QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows)
+                self._tree.scrollTo(tree_index)
+
+        self._select_loaded_entry(username=username, ip_or_range=ip_or_range)
+
+    def _select_loaded_entry(self, *, username: str, ip_or_range: str) -> None:
+        """Select the first row in the loaded database matching the given username and entry value."""
+        if not username or not ip_or_range:
+            return
+
+        for row in range(self._model.rowCount()):
+            username_item = self._model.item(row, USERNAME_COLUMN)
+            if not username_item:
+                continue
+
+            row_username = username_item.text().strip()
+            row_ip_or_range = self._get_row_entry_value(row).strip()
+            if row_username != username or row_ip_or_range != ip_or_range:
+                continue
+
+            source_index = self._model.index(row, USERNAME_COLUMN)
+            proxy_index = self._proxy.mapFromSource(source_index)
+            if not proxy_index.isValid():
+                return
+
+            selection = self._entries_table.selectionModel()
+            if selection:
+                selection.select(proxy_index, QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows)
+            self._entries_table.setCurrentIndex(proxy_index)
+            self._entries_table.scrollTo(proxy_index)
+            return
+
+    def on_entry_double_clicked(self, index: QModelIndex) -> None:
+        """Handle double-click on an entry row in global search mode."""
+        if not self._global_search_active or not index.isValid():
+            return
+        source_index = self._proxy.mapToSource(index)
+        row = source_index.row()
+        username_item = self._model.item(row, USERNAME_COLUMN)
+        db_item = self._model.item(source_index.row(), DATABASE_COLUMN)
+        if not db_item:
+            return
+        db_path_str = db_item.data(Qt.ItemDataRole.UserRole)
+        if db_path_str:
+            username = username_item.text() if username_item else ''
+            ip_or_range = self._get_row_entry_value(row)
+            self._navigate_to_database(Path(db_path_str), username=username, ip_or_range=ip_or_range)

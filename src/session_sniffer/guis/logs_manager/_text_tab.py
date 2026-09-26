@@ -1,0 +1,247 @@
+"""Plain-text log tab — for warnings.log and errors.log."""
+
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
+
+from PySide6.QtGui import QColor, QIcon, QTextCharFormat, QTextCursor
+from PySide6.QtWidgets import (
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from session_sniffer.constants.local import RESOURCES_DIR_PATH
+from session_sniffer.constants.standalone import TITLE
+from session_sniffer.guis.file_watch import DebouncedFileWatcher
+from session_sniffer.guis.logs_manager._helpers import (
+    LARGE_TEXT_FILE_LIMIT,
+    LogLevelHighlighter,
+    add_purge_and_location_buttons,
+    copy_viewer_text_to_clipboard,
+    create_log_viewer,
+    file_metadata_text,
+    prepare_search,
+    purge_log_file,
+    setup_copy_save_button_row,
+    setup_metadata_label,
+)
+from session_sniffer.guis.userip_manager_helpers import human_readable_size
+
+if TYPE_CHECKING:
+    from typing import Any
+
+
+class TextLogTab(QWidget):
+    """Plain-text log viewer with search highlighting, auto-refresh, and log-level coloring."""
+
+    def __init__(self, file_path: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._file_path = file_path
+        self._search_matches: list[QTextCursor] = []
+        self._current_match_index = -1
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        # --- Top bar ---
+        top_bar = QHBoxLayout()
+
+        top_bar.addWidget(QLabel('Rechercher :'))
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText('Chercher dans le log…')
+        self._search_input.returnPressed.connect(self._find_next)
+        self._search_input.textChanged.connect(self._on_search_changed)
+        top_bar.addWidget(self._search_input, stretch=1)
+
+        prev_button = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'menu_arrow_left.svg')), '')
+        prev_button.setToolTip('Résultat précédent')
+        prev_button.setFixedWidth(30)
+        prev_button.clicked.connect(self._find_prev)
+        top_bar.addWidget(prev_button)
+
+        next_button = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'menu_arrow_right.svg')), '')
+        next_button.setToolTip('Résultat suivant')
+        next_button.setFixedWidth(30)
+        next_button.clicked.connect(self._find_next)
+        top_bar.addWidget(next_button)
+
+        self._match_label = QLabel('')
+        top_bar.addWidget(self._match_label)
+
+        self._line_count_label = QLabel('')
+        top_bar.addWidget(self._line_count_label)
+
+        layout.addLayout(top_bar)
+
+        # --- Text viewer ---
+        self._viewer = create_log_viewer()
+
+        document = self._viewer.document()
+        self._highlighter = LogLevelHighlighter(document) if document else None
+
+        layout.addWidget(self._viewer, stretch=1)
+
+        # --- Metadata ---
+        self._metadata_label = setup_metadata_label(layout)
+
+        # --- Bottom buttons ---
+        # pylint: disable=duplicate-code
+        button_row = setup_copy_save_button_row(
+            layout,
+            self._copy_all,
+            self._save_as,
+            copy_tooltip='Copy all log text to clipboard',
+            save_tooltip='Save the log to a new file',
+        )
+        # pylint: enable=duplicate-code
+
+        add_purge_and_location_buttons(button_row, self._purge_file, self._file_path)
+
+        # --- Auto-refresh from disk ---
+        self._watcher = DebouncedFileWatcher(self, self.load_data)
+        self._watcher.watch(files=[self._file_path], directories=[self._file_path.parent])
+
+        # Initial load
+        self.load_data()
+
+    # ------------------------------------------------------------------
+    # Data loading
+    # ------------------------------------------------------------------
+
+    def load_data(self) -> None:
+        """Read the text file and display its contents."""
+        if not self._file_path.exists():
+            self._viewer.setPlainText(f'[{self._file_path.name} introuvable]')
+            self._line_count_label.setText('0 ligne')
+            self._metadata_label.setText(file_metadata_text(self._file_path))
+            return
+
+        try:
+            file_size = self._file_path.stat().st_size
+            truncated = file_size > LARGE_TEXT_FILE_LIMIT
+
+            with self._file_path.open(encoding='utf-8', errors='replace') as file:
+                if truncated:
+                    file.seek(max(0, file_size - LARGE_TEXT_FILE_LIMIT))
+                    file.readline()  # Skip partial first line
+                text = file.read()
+
+            # Preserve scroll position
+            scrollbar = self._viewer.verticalScrollBar()
+            old_scroll = scrollbar.value() if scrollbar else 0
+            old_max = scrollbar.maximum() if scrollbar else 0
+
+            prefix = f'[…truncated — showing last {human_readable_size(LARGE_TEXT_FILE_LIMIT)} of {human_readable_size(file_size)}…]\n\n' if truncated else ''
+            self._viewer.setPlainText(prefix + text)
+
+            if scrollbar:
+                if old_max > 0 and old_scroll >= old_max - 5:
+                    scrollbar.setValue(scrollbar.maximum())
+                else:
+                    scrollbar.setValue(old_scroll)
+
+            line_count = text.count('\n') + (1 if text and not text.endswith('\n') else 0)
+            suffix = ' (truncated)' if truncated else ''
+            self._line_count_label.setText(f'{line_count:,} lines{suffix}')
+
+        except PermissionError:
+            self._viewer.setPlainText(f'[Impossible de lire {self._file_path.name} : fichier verrouillé]')
+            self._line_count_label.setText('')
+
+        self._metadata_label.setText(file_metadata_text(self._file_path))
+
+        if self._search_input.text():
+            self._on_search_changed(self._search_input.text())
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
+    def _on_search_changed(self, text: str) -> None:
+        self._search_matches.clear()
+        self._current_match_index = -1
+
+        document = prepare_search(text, self._match_label, self._viewer)
+        if document is None:
+            return
+        cursor = document.find(text)
+        while not cursor.isNull():
+            self._search_matches.append(QTextCursor(cursor))
+            cursor = document.find(text, cursor)
+
+        self._highlight_all_matches()
+        if self._search_matches:
+            self._current_match_index = 0
+            self._go_to_match(0)
+        self._update_match_label()
+
+    def _highlight_all_matches(self) -> None:
+        selections: list[Any] = []
+        highlight_format = QTextCharFormat()
+        highlight_format.setBackground(QColor('#e3b341'))
+        highlight_format.setForeground(QColor('#000000'))
+
+        for cursor in self._search_matches:
+            selection = cast('Any', QTextEdit.ExtraSelection())
+            selection.cursor = cursor
+            selection.format = highlight_format
+            selections.append(selection)
+
+        self._viewer.setExtraSelections(selections)
+
+    def _go_to_match(self, index: int) -> None:
+        if 0 <= index < len(self._search_matches):
+            self._viewer.setTextCursor(self._search_matches[index])
+            self._viewer.centerCursor()
+
+    def _find_next(self) -> None:
+        if not self._search_matches:
+            return
+        self._current_match_index = (self._current_match_index + 1) % len(self._search_matches)
+        self._go_to_match(self._current_match_index)
+        self._update_match_label()
+
+    def _find_prev(self) -> None:
+        if not self._search_matches:
+            return
+        self._current_match_index = (self._current_match_index - 1) % len(self._search_matches)
+        self._go_to_match(self._current_match_index)
+        self._update_match_label()
+
+    def _update_match_label(self) -> None:
+        count = len(self._search_matches)
+        if not count:
+            self._match_label.setText('Aucun résultat')
+        else:
+            self._match_label.setText(f'{self._current_match_index + 1} / {count}')
+
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
+
+    def _copy_all(self) -> None:
+        copy_viewer_text_to_clipboard(self._viewer)
+
+    def _save_as(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            'Save Log As',
+            str(self._file_path.with_suffix('.export.log')),
+            'Log Files (*.log);;Text Files (*.txt);;All Files (*)',
+        )
+        if not path:
+            return
+        Path(path).write_text(self._viewer.toPlainText(), encoding='utf-8')
+        QMessageBox.information(self, TITLE, f'Enregistré dans {path}')
+
+    def _purge_file(self) -> None:
+        message = purge_log_file(self, self._file_path, item_label='contents')
+        if message is not None:
+            QMessageBox.information(self, TITLE, message)
+            self.load_data()

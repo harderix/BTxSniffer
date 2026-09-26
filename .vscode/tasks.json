@@ -1,0 +1,413 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "🚀 Launch Session Sniffer",
+            "type": "shell",
+            "windows": {
+                "command": "${workspaceFolder}/.venv/Scripts/python.exe"
+            },
+            "linux": {
+                "command": "${workspaceFolder}/.venv/bin/python"
+            },
+            "osx": {
+                "command": "${workspaceFolder}/.venv/bin/python"
+            },
+            "args": ["-m", "session_sniffer"],
+            "options": {
+                "env": {
+                    "PYTHONPATH": "${workspaceFolder}/src"
+                }
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "new",
+                "clear": true
+            }
+        },
+        {
+            "label": "🔎 Run All Quality Checks",
+            "type": "shell",
+            "windows": {
+                "command": "${workspaceFolder}/.venv/Scripts/python.exe"
+            },
+            "linux": {
+                "command": "${workspaceFolder}/.venv/bin/python"
+            },
+            "osx": {
+                "command": "${workspaceFolder}/.venv/bin/python"
+            },
+            "args": ["${workspaceFolder}/code_quality_checks.py"],
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        },
+        {
+            "label": "📦 Install Dependencies",
+            "type": "shell",
+            "windows": {
+                "command": "${workspaceFolder}/.venv/Scripts/pip"
+            },
+            "linux": {
+                "command": "${workspaceFolder}/.venv/bin/pip"
+            },
+            "osx": {
+                "command": "${workspaceFolder}/.venv/bin/pip"
+            },
+            "args": ["install", "-e", ".[dev]"],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "🔄 Check Project Dependencies",
+            "type": "shell",
+            "windows": {
+                "command": "${workspaceFolder}/.venv/Scripts/python.exe"
+            },
+            "linux": {
+                "command": "${workspaceFolder}/.venv/bin/python"
+            },
+            "osx": {
+                "command": "${workspaceFolder}/.venv/bin/python"
+            },
+            "args": ["${workspaceFolder}/check_project_dependencies.py"],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "new",
+                "clear": true
+            }
+        },
+        {
+            "label": "⚡ Ruff - Fast Python Linter",
+            "type": "shell",
+            "windows": {
+                "command": "${workspaceFolder}/.venv/Scripts/ruff.exe"
+            },
+            "linux": {
+                "command": "${workspaceFolder}/.venv/bin/ruff"
+            },
+            "osx": {
+                "command": "${workspaceFolder}/.venv/bin/ruff"
+            },
+            "args": ["check", ".", "--config", "pyproject.toml"],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        },
+        {
+            "label": "📝 Flake8 - Style Guide Enforcer",
+            "type": "shell",
+            "windows": {
+                "command": "${workspaceFolder}/.venv/Scripts/flake8.exe"
+            },
+            "linux": {
+                "command": "${workspaceFolder}/.venv/bin/flake8"
+            },
+            "osx": {
+                "command": "${workspaceFolder}/.venv/bin/flake8"
+            },
+            "args": [".", "--config", ".flake8"],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        },
+        {
+            "label": "🧹 Pylint - Code Quality Analyzer",
+            "type": "shell",
+            "windows": {
+                "command": "${workspaceFolder}/.venv/Scripts/pylint.exe"
+            },
+            "linux": {
+                "command": "${workspaceFolder}/.venv/bin/pylint"
+            },
+            "osx": {
+                "command": "${workspaceFolder}/.venv/bin/pylint"
+            },
+            "args": [".", "--rcfile", "pyproject.toml"],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        },
+        {
+            "label": "🎯 Pyright - Microsoft Type Checker",
+            "type": "shell",
+            "windows": {
+                "command": "${workspaceFolder}/.venv/Scripts/pyright.exe"
+            },
+            "linux": {
+                "command": "${workspaceFolder}/.venv/bin/pyright"
+            },
+            "osx": {
+                "command": "${workspaceFolder}/.venv/bin/pyright"
+            },
+            "args": [".", "--project", "pyproject.toml"],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        },
+        {
+            "label": "🔬 MyPy - Static Type Checker",
+            "type": "shell",
+            "windows": {
+                "command": "${workspaceFolder}/.venv/Scripts/mypy.exe"
+            },
+            "linux": {
+                "command": "${workspaceFolder}/.venv/bin/mypy"
+            },
+            "osx": {
+                "command": "${workspaceFolder}/.venv/bin/mypy"
+            },
+            "args": [".", "--config-file", "pyproject.toml"],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        },
+        {
+            "label": "🔥 Pyrefly - Static Type Checker",
+            "type": "shell",
+            "windows": {
+                "command": "${workspaceFolder}/.venv/Scripts/pyrefly.exe"
+            },
+            "linux": {
+                "command": "${workspaceFolder}/.venv/bin/pyrefly"
+            },
+            "osx": {
+                "command": "${workspaceFolder}/.venv/bin/pyrefly"
+            },
+            "args": ["check", "."],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        },
+        {
+            "label": "🧪 Ty - Type Checker",
+            "type": "shell",
+            "windows": {
+                "command": "${workspaceFolder}/.venv/Scripts/ty.exe"
+            },
+            "linux": {
+                "command": "${workspaceFolder}/.venv/bin/ty"
+            },
+            "osx": {
+                "command": "${workspaceFolder}/.venv/bin/ty"
+            },
+            "args": ["check", "."],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        },
+        {
+            "label": "🦅 Vulture - Dead Code Detector",
+            "type": "shell",
+            "windows": {
+                "command": "${workspaceFolder}/.venv/Scripts/vulture.exe"
+            },
+            "linux": {
+                "command": "${workspaceFolder}/.venv/bin/vulture"
+            },
+            "osx": {
+                "command": "${workspaceFolder}/.venv/bin/vulture"
+            },
+            "args": [".", "--config", "pyproject.toml"],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        },
+        {
+            "label": "🔐 Pip Audit - Vulnerability Scanner",
+            "type": "shell",
+            "windows": {
+                "command": "${workspaceFolder}/.venv/Scripts/pip-audit.exe"
+            },
+            "linux": {
+                "command": "${workspaceFolder}/.venv/bin/pip-audit"
+            },
+            "osx": {
+                "command": "${workspaceFolder}/.venv/bin/pip-audit"
+            },
+            "args": ["--local", "--skip-editable"],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        },
+        {
+            "label": "🐍 Snyk - Developer Security Platform",
+            "type": "shell",
+            "windows": {
+                "command": "powershell.exe",
+                "args": ["-Command", "& \"${workspaceFolder}/.venv/Scripts/Activate.ps1\"; uv export --no-hashes --no-emit-project -o .requirements-snyk.tmp.txt; try { snyk test --file=.requirements-snyk.tmp.txt --package-manager=pip --command=\"${workspaceFolder}/.venv/Scripts/python.exe\" } finally { Remove-Item -ErrorAction SilentlyContinue .requirements-snyk.tmp.txt }"]
+            },
+            "linux": {
+                "command": "bash",
+                "args": ["-c", "source \"${workspaceFolder}/.venv/bin/activate\" && uv export --no-hashes --no-emit-project -o .requirements-snyk.tmp.txt && { snyk test --file=.requirements-snyk.tmp.txt --package-manager=pip --command=\"${workspaceFolder}/.venv/bin/python\"; status=$?; rm -f .requirements-snyk.tmp.txt; exit $status; }"]
+            },
+            "osx": {
+                "command": "bash",
+                "args": ["-c", "source \"${workspaceFolder}/.venv/bin/activate\" && uv export --no-hashes --no-emit-project -o .requirements-snyk.tmp.txt && { snyk test --file=.requirements-snyk.tmp.txt --package-manager=pip --command=\"${workspaceFolder}/.venv/bin/python\"; status=$?; rm -f .requirements-snyk.tmp.txt; exit $status; }"]
+            },
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        },
+        {
+            "label": "🌐 Verify IP Ranges",
+            "type": "shell",
+            "windows": {
+                "command": "${workspaceFolder}/.venv/Scripts/python.exe"
+            },
+            "linux": {
+                "command": "${workspaceFolder}/.venv/bin/python"
+            },
+            "osx": {
+                "command": "${workspaceFolder}/.venv/bin/python"
+            },
+            "args": [
+                "${workspaceFolder}/.dev/verify_ranges.py",
+                "${workspaceFolder}/src/session_sniffer/networking/third_party_servers_ranges.py",
+                "${input:useGeoLite2}",
+                "${input:ipApiFallback}",
+                "${input:onlyDetections}",
+                "${input:exportDetections}"
+            ],
+            "options": {
+                "env": {
+                    "PYTHONPATH": "${workspaceFolder}/src"
+                }
+            },
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "new",
+                "clear": true
+            }
+        }
+    ],
+    "inputs": [
+        {
+            "id": "useGeoLite2",
+            "type": "pickString",
+            "description": "Verify using local GeoLite2 instead of IP-API?",
+            "options": [
+                {
+                    "label": "No (Use IP-API)",
+                    "value": ""
+                },
+                {
+                    "label": "Yes (Use local GeoLite2)",
+                    "value": "--geolite2"
+                }
+            ],
+            "default": "--geolite2"
+        },
+        {
+            "id": "ipApiFallback",
+            "type": "pickString",
+            "description": "Allow unknown GeoLite2 ranges to fallback to IP-API?",
+            "options": [
+                {
+                    "label": "Yes (Fallback to IP-API)",
+                    "value": "--ip-api-fallback"
+                },
+                {
+                    "label": "No (Do not fallback)",
+                    "value": ""
+                }
+            ],
+            "default": ""
+        },
+        {
+            "id": "onlyDetections",
+            "type": "pickString",
+            "description": "Only show actual detections (mismatches, expansions, warnings)?",
+            "options": [
+                {
+                    "label": "No (Show everything)",
+                    "value": ""
+                },
+                {
+                    "label": "Yes (Only show detections)",
+                    "value": "--only-detections"
+                }
+            ],
+            "default": "--only-detections"
+        },
+        {
+            "id": "exportDetections",
+            "type": "pickString",
+            "description": "Export detections to detections.txt in workspace root?",
+            "options": [
+                {
+                    "label": "No (Do not export)",
+                    "value": ""
+                },
+                {
+                    "label": "Yes (Save to detections.txt)",
+                    "value": "--export=detections.txt"
+                }
+            ],
+            "default": ""
+        }
+    ]
+}

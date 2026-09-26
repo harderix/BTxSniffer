@@ -1,0 +1,83 @@
+"""Pydantic model for the Looky System IP-to-player lookup API response."""
+
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel
+
+LookyInstructionStatus = Literal['queued', 'running', 'completed', 'failed', 'canceled', 'unknown']
+
+
+class LookyPlayer(BaseModel):
+    """A single player entry returned by the Looky System API for a given IP."""
+
+    rockstarid: int
+    name: str
+    lastSeen: datetime  # noqa: N815
+    lastCountry: str  # noqa: N815
+    isModder: bool  # noqa: N815
+    isEnhanced: bool  # noqa: N815
+    isLegacy: bool  # noqa: N815
+    isVpn: bool  # noqa: N815
+
+
+class LookyIpBatchResult(BaseModel):
+    """One entry in a Looky System `/api/search/ip-batch` response, mapping an IP to its player list."""
+
+    ip: str
+    players: list[LookyPlayer]
+
+
+class LookyWhoAmI(BaseModel):
+    """Raw response shape returned by `GET /api/whoami`."""
+
+    authenticated: bool
+    source: str
+    apiAccess: bool  # noqa: N815
+    status: bool
+    username: str
+    rid: int
+
+
+class LookyUserData(BaseModel):
+    """User account data derived from a successful Looky System API key verification."""
+
+    username: str
+    apiAccess: bool  # noqa: N815
+    status: bool
+    rid: int
+
+
+class LookyVerifyResponse(BaseModel):
+    """Result of verifying a Looky System API key via `GET /api/whoami`."""
+
+    success: bool
+    message: str | None = None
+    userData: LookyUserData  # noqa: N815
+
+
+class LookyInstructionStatusEventData(BaseModel):
+    """Payload of a Looky System `status_update` SSE event."""
+
+    status: LookyInstructionStatus
+    result: str | None = None
+
+
+class LookyInstructionStatusEvent(BaseModel):
+    """Top-level shape of a Looky System SSE `status_update` event JSON line."""
+
+    data: LookyInstructionStatusEventData
+
+
+class LookyInstructionStatusInitialInstruction(BaseModel):
+    """The instruction object returned by the initial status endpoint."""
+
+    status: LookyInstructionStatus
+    result: str | None = None
+
+
+class LookyInstructionStatusInitialResponse(BaseModel):
+    """Raw response shape returned by `GET /api/instruction-status-initial/...`."""
+
+    success: bool
+    instruction: LookyInstructionStatusInitialInstruction

@@ -1,0 +1,424 @@
+"""High Rate Monitor — tracks players exceeding configurable PPS and BPS thresholds."""
+
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import TYPE_CHECKING, ClassVar, override
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from session_sniffer.constants.standard import LOCAL_TZ
+from session_sniffer.guis.player_rate_graph import DEFAULT_MAX_HISTORY, PlayerRateGraphWindow
+from session_sniffer.models.player import PlayerBandwidth
+from session_sniffer.networking.third_party_servers import is_third_party_server_ip
+from session_sniffer.player.registry import PlayersRegistry
+from session_sniffer.settings import Settings
+from session_sniffer.text_utils import pluralize
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from PySide6.QtGui import QHideEvent, QShowEvent
+
+_UPDATE_INTERVAL_MS = 1_000
+_KBS_TO_BYTES = 1024
+
+
+def _make_rate_history() -> deque[int]:
+    return deque(maxlen=DEFAULT_MAX_HISTORY)
+
+
+@dataclass(kw_only=True, slots=True)
+class _PlayerRateData:
+    ip: str
+    pps: int
+    bps: int = 0
+    usernames: list[str] = field(default_factory=list[str])
+
+    # Rate history (rolling window matching graph length)
+    pps_history: deque[int] = field(default_factory=_make_rate_history)
+    bps_history: deque[int] = field(default_factory=_make_rate_history)
+
+    # PPS tracking
+    first_high_pps_time: datetime | None = None
+    newer_high_pps_time: datetime | None = None
+    is_high_pps: bool = False
+    current_pps_duration: int = 0
+    total_pps_duration: int = 0
+
+    # BPS tracking
+    first_high_bps_time: datetime | None = None
+    newer_high_bps_time: datetime | None = None
+    is_high_bps: bool = False
+    current_bps_duration: int = 0
+    total_bps_duration: int = 0
+
+    def update_pps_stats(self, *, now: datetime, pps: int, threshold: int, required_duration: int) -> None:
+        """Update high-PPS status for this player."""
+        self.pps = pps
+        self.pps_history.append(pps)
+        if pps < threshold:
+            self.is_high_pps = False
+            self.newer_high_pps_time = None
+            self.current_pps_duration = 0
+            return
+
+        if self.first_high_pps_time is None:
+            self.first_high_pps_time = now
+        if self.newer_high_pps_time is None:
+            self.newer_high_pps_time = now
+
+        self.current_pps_duration = int((now - self.newer_high_pps_time).total_seconds())
+        self.total_pps_duration = int((now - self.first_high_pps_time).total_seconds())
+
+        if self.current_pps_duration >= required_duration:
+            self.is_high_pps = True
+
+    def update_bps_stats(self, *, now: datetime, bps: int, threshold: int, required_duration: int) -> None:
+        """Update high-BPS status for this player."""
+        self.bps = bps
+        self.bps_history.append(bps)
+        if bps < threshold:
+            self.is_high_bps = False
+            self.newer_high_bps_time = None
+            self.current_bps_duration = 0
+            return
+
+        if self.first_high_bps_time is None:
+            self.first_high_bps_time = now
+        if self.newer_high_bps_time is None:
+            self.newer_high_bps_time = now
+
+        self.current_bps_duration = int((now - self.newer_high_bps_time).total_seconds())
+        self.total_bps_duration = int((now - self.first_high_bps_time).total_seconds())
+
+        if self.current_bps_duration >= required_duration:
+            self.is_high_bps = True
+
+
+class HighRateTracker:
+    """Global tracker for IPs currently flagged as high-rate."""
+
+    flagged_ips: ClassVar[set[str]] = set()
+
+    @classmethod
+    def is_high_rate(cls, ip: str) -> bool:
+        """Return whether the given IP is currently flagged as high-rate."""
+        return ip in cls.flagged_ips
+
+    @classmethod
+    def set_flagged_ips(cls, ips: set[str]) -> None:
+        """Update the set of flagged high-rate IPs."""
+        cls.flagged_ips = ips
+
+
+class HighRateMonitorWidget(QWidget):
+    """Widget monitoring players that exceed configurable PPS and BPS thresholds."""
+
+    def __init__(
+        self,
+        select_ips_callback: Callable[[list[str]], None] | None = None,
+        deselect_ips_callback: Callable[[list[str] | None], None] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        """Initialize the High Rate Monitor widget."""
+        super().__init__(parent)
+
+        self._select_ips = select_ips_callback
+        self._deselect_ips = deselect_ips_callback
+        self._tracked: dict[str, _PlayerRateData] = {}
+        self._blacklisted_ips: set[str] = set()
+        self._graph_windows: dict[str, PlayerRateGraphWindow] = {}
+        self._currently_selected_ips: set[str] = set()
+        self._auto_select: bool = Settings.high_rate_monitor_auto_select
+
+        self.pps_threshold = Settings.high_rate_monitor_pps_threshold
+        self.bps_threshold = Settings.high_rate_monitor_bps_threshold * _KBS_TO_BYTES
+        self.required_duration = Settings.high_rate_monitor_duration_threshold
+
+        layout = QVBoxLayout(self)
+
+        # Status summary label
+        self._status_label = QLabel("<b>État :</b> Démarrage de l'analyse…")
+        self._status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status_label.setWordWrap(True)
+        layout.addWidget(self._status_label)
+
+        # Selection controls row
+        selection_layout = QHBoxLayout()
+        selection_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._select_button = QPushButton('Sélectionner dans le tableau')
+        self._select_button.setToolTip('Sélectionner et afficher tous les joueurs à trafic élevé dans le tableau des joueurs connectés.')
+        self._select_button.setMinimumWidth(140)
+        self._select_button.clicked.connect(self._select_flagged)
+        self._select_button.setEnabled(False)
+        selection_layout.addWidget(self._select_button)
+
+        self._deselect_button = QPushButton('Désélectionner dans le tableau')
+        self._deselect_button.setToolTip('Désélectionner tous les joueurs à trafic élevé dans le tableau des joueurs connectés.')
+        self._deselect_button.setMinimumWidth(140)
+        self._deselect_button.clicked.connect(self._deselect_flagged)
+        self._deselect_button.setEnabled(False)
+        selection_layout.addWidget(self._deselect_button)
+
+        self._auto_select_checkbox = QCheckBox('Sélection auto dans le tableau')
+        self._auto_select_checkbox.setToolTip(
+            'Garder automatiquement les joueurs à trafic élevé sélectionnés dans le tableau des joueurs connectés.\n\nMise à jour à chaque analyse. Désactive pour sélectionner toi-même.',
+        )
+        self._auto_select_checkbox.setChecked(self._auto_select)
+        self._auto_select_checkbox.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._auto_select_checkbox.toggled.connect(self._on_auto_select_toggled)
+        selection_layout.addWidget(self._auto_select_checkbox)
+
+        layout.addLayout(selection_layout)
+
+        # Action buttons row
+        actions_layout = QHBoxLayout()
+        actions_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        open_all_graphs = QPushButton('Ouvrir les graphiques des joueurs signalés')
+        open_all_graphs.setToolTip(
+            'Ouvre une fenêtre de graphique PPS/BPS en direct pour chaque joueur\nqui dépasse les deux seuils.\n\nChaque graphique se met à jour en temps réel pour comparer les trafics.',
+        )
+        open_all_graphs.setMinimumWidth(240)
+        open_all_graphs.clicked.connect(self._open_all_graphs)
+        actions_layout.addWidget(open_all_graphs)
+
+        reset_button = QPushButton("Réinitialiser l'analyse")
+        reset_button.setToolTip(
+            "Efface toutes les données suivies, l'historique et les joueurs signalés.\nL'analyse repart de zéro immédiatement.",
+        )
+        reset_button.setMinimumWidth(130)
+        reset_button.clicked.connect(self.reset_all)
+        actions_layout.addWidget(reset_button)
+
+        clear_bl_button = QPushButton('Vider la liste noire')
+        clear_bl_button.setToolTip(
+            "Retire toutes les IP de la liste noire pour qu'elles soient de nouveau suivies.\n\nLes IP en liste noire sont exclues de la détection de trafic élevé.",
+        )
+        clear_bl_button.setMinimumWidth(130)
+        clear_bl_button.clicked.connect(self._clear_blacklist)
+        actions_layout.addWidget(clear_bl_button)
+
+        layout.addLayout(actions_layout)
+
+        # Periodic scan timer
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._scan_players)
+        if Settings.high_rate_monitor_run_in_background:
+            self._timer.start(_UPDATE_INTERVAL_MS)
+            self._scan_players()
+
+    # Scanning ---------------------------------------------------------------
+
+    def _scan_players(self) -> None:
+        players = [
+            player
+            for player in PlayersRegistry.get_connected_players()
+            if player.ip not in self._blacklisted_ips and not is_third_party_server_ip(player.ip)
+        ]
+
+        now = datetime.now(tz=LOCAL_TZ)
+        connected_ips: set[str] = set()
+        for player in players:
+            connected_ips.add(player.ip)
+            if player.ip not in self._tracked:
+                self._tracked[player.ip] = _PlayerRateData(
+                    ip=player.ip,
+                    pps=player.packets.pps.calculated_rate,
+                    bps=player.bandwidth.bps.calculated_rate,
+                )
+            self._tracked[player.ip].usernames = list(player.usernames)
+            self._tracked[player.ip].update_pps_stats(
+                now=now,
+                pps=player.packets.pps.calculated_rate,
+                threshold=self.pps_threshold,
+                required_duration=self.required_duration,
+            )
+            self._tracked[player.ip].update_bps_stats(
+                now=now,
+                bps=player.bandwidth.bps.calculated_rate,
+                threshold=self.bps_threshold,
+                required_duration=self.required_duration,
+            )
+
+        for ip in self._tracked.keys() - connected_ips:
+            del self._tracked[ip]
+
+        flagged_players = [player for player in self._tracked.values() if player.is_high_pps and player.is_high_bps]
+        flagged_ips = {player.ip for player in flagged_players}
+        HighRateTracker.set_flagged_ips(flagged_ips)
+
+        if not self.isVisible():
+            if self._auto_select and self._currently_selected_ips and self._deselect_ips is not None:
+                self._deselect_ips(list(self._currently_selected_ips))
+                self._currently_selected_ips.clear()
+        elif self._auto_select and flagged_ips != self._currently_selected_ips:
+            if flagged_ips:
+                if self._select_ips is not None:
+                    self._select_ips(list(flagged_ips))
+            elif self._currently_selected_ips and self._deselect_ips is not None:
+                self._deselect_ips(list(self._currently_selected_ips))
+            self._currently_selected_ips = set(flagged_ips)
+
+        for ip, graph in list(self._graph_windows.items()):
+            data = self._tracked.get(ip)
+            graph.update_rates(
+                pps=data.pps if data else 0,
+                bps=data.bps if data else 0,
+            )
+            matched_player = PlayersRegistry.get_player_by_ip(ip)
+            graph.update_usernames(matched_player.usernames if matched_player is not None else [])
+
+        self._update_status_display(flagged_players)
+
+    def _update_status_display(self, flagged_players: list[_PlayerRateData]) -> None:
+        num_flagged = len(flagged_players)
+        if not num_flagged:
+            num_connected = len(self._tracked)
+            self._status_label.setText(
+                f'<b>Aucun joueur à trafic élevé détecté.</b><br><small>Surveillance de {num_connected} IP connectée{pluralize(num_connected)}.</small>',
+            )
+            return
+
+        lines: list[str] = [
+            f'<b style="color:#e74c3c;">{num_flagged} joueur{pluralize(num_flagged)} au-dessus des seuils :</b>',
+        ]
+        for player in flagged_players:
+            name_part = f' ({", ".join(player.usernames)})' if player.usernames else ''
+            formatted_bps = PlayerBandwidth.format_bytes(player.bps)
+            lines.append(
+                f'• <b>{player.ip}</b>{name_part} — {player.pps} PPS · {formatted_bps} · série : {player.current_pps_duration}s (total : {player.total_pps_duration}s)',
+            )
+        lines.append('<small>Les joueurs signalés ont une icône de compteur de vitesse dans le tableau des joueurs connectés.</small>')
+        self._status_label.setText('<br>'.join(lines))
+
+    def apply_settings(self) -> None:
+        """Apply updated threshold and auto-select settings from `Settings`."""
+        self.pps_threshold = Settings.high_rate_monitor_pps_threshold
+        self.bps_threshold = Settings.high_rate_monitor_bps_threshold * _KBS_TO_BYTES
+        self.required_duration = Settings.high_rate_monitor_duration_threshold
+        for graph in self._graph_windows.values():
+            graph.set_pps_threshold(self.pps_threshold)
+            graph.set_bps_threshold(self.bps_threshold)
+        self._auto_select_checkbox.setChecked(Settings.high_rate_monitor_auto_select)
+
+    # Graphs -----------------------------------------------------------------
+
+    def open_graph(self, ip: str) -> None:
+        """Open or focus a live rate graph window for the given player IP."""
+        existing = self._graph_windows.get(ip)
+        if existing:
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            return
+
+        graph = PlayerRateGraphWindow(
+            ip=ip,
+            initial_pps_threshold=self.pps_threshold,
+            initial_bps_threshold=self.bps_threshold,
+        )
+        data = self._tracked.get(ip)
+        if data is not None:
+            graph.load_history(pps_history=list(data.pps_history), bps_history=list(data.bps_history))
+        matched_player = PlayersRegistry.get_player_by_ip(ip)
+        if matched_player is not None:
+            graph.update_usernames(matched_player.usernames)
+        graph.show()
+        graph.destroyed.connect(lambda: self._graph_windows.pop(ip, None))
+        self._graph_windows[ip] = graph
+
+    def _open_all_graphs(self) -> None:
+        for player in self._tracked.values():
+            if player.is_high_pps and player.is_high_bps:
+                self.open_graph(player.ip)
+
+    # Actions ----------------------------------------------------------------
+
+    def _on_auto_select_toggled(self, checked: bool) -> None:  # noqa: FBT001
+        self._auto_select = checked
+        self._select_button.setEnabled(not checked)
+        self._deselect_button.setEnabled(not checked)
+        if checked:
+            flagged_ips = [p.ip for p in self._tracked.values() if p.is_high_pps and p.is_high_bps]
+            if flagged_ips and self._select_ips is not None:
+                self._select_ips(flagged_ips)
+                self._currently_selected_ips = set(flagged_ips)
+        elif self._currently_selected_ips and self._deselect_ips is not None:
+            self._deselect_ips(list(self._currently_selected_ips))
+            self._currently_selected_ips.clear()
+
+    def _select_flagged(self) -> None:
+        if self._select_ips is not None:
+            flagged_ips = [p.ip for p in self._tracked.values() if p.is_high_pps and p.is_high_bps]
+            if flagged_ips:
+                self._select_ips(flagged_ips)
+                self._currently_selected_ips = set(flagged_ips)
+
+    def _deselect_flagged(self) -> None:
+        if self._deselect_ips is not None:
+            flagged_ips = {p.ip for p in self._tracked.values() if p.is_high_pps and p.is_high_bps}
+            ips_to_deselect = list(self._currently_selected_ips | flagged_ips)
+            self._deselect_ips(ips_to_deselect or None)
+            self._currently_selected_ips.clear()
+
+    def reset_all(self) -> None:
+        """Clear all tracked player rate data and reset scan."""
+        if self._currently_selected_ips and self._deselect_ips is not None:
+            self._deselect_ips(list(self._currently_selected_ips))
+        self._currently_selected_ips.clear()
+        self._tracked.clear()
+        HighRateTracker.set_flagged_ips(set())
+        self._status_label.setText('<b>État :</b> Analyse réinitialisée. Collecte des données…')
+
+    def _clear_blacklist(self) -> None:
+        self._blacklisted_ips.clear()
+
+    def blacklist_ip(self, ip: str) -> None:
+        """Add an IP to the blacklist to exclude it from high-rate detection."""
+        self._blacklisted_ips.add(ip)
+        self._tracked.pop(ip, None)
+
+    def start_monitoring(self) -> None:
+        """Start periodic rate monitoring if not already active."""
+        if not self._timer.isActive():
+            self._timer.start(_UPDATE_INTERVAL_MS)
+            self._scan_players()
+
+    def stop_monitoring(self) -> None:
+        """Stop periodic rate monitoring and clear flagged IPs."""
+        if self._timer.isActive():
+            self._timer.stop()
+        self.reset_all()
+
+    def get_tracked(self, ip: str) -> _PlayerRateData | None:
+        """Return the tracked rate data for the given IP, or None."""
+        return self._tracked.get(ip)
+
+    @override
+    def showEvent(self, event: QShowEvent) -> None:
+        """Select flagged high-rate players if auto-selection is enabled upon showing the monitor."""
+        super().showEvent(event)
+        if self._auto_select:
+            flagged_ips = [player.ip for player in self._tracked.values() if player.is_high_pps and player.is_high_bps]
+            if flagged_ips and self._select_ips is not None:
+                self._select_ips(flagged_ips)
+                self._currently_selected_ips = set(flagged_ips)
+
+    @override
+    def hideEvent(self, event: QHideEvent) -> None:
+        """Deselect auto-selected players when the monitor window or tab is hidden."""
+        super().hideEvent(event)
+        if self._auto_select and self._currently_selected_ips and self._deselect_ips is not None:
+            self._deselect_ips(list(self._currently_selected_ips))
+            self._currently_selected_ips.clear()

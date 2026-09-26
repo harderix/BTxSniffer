@@ -1,0 +1,259 @@
+"""File, folder, and URL open helpers mixin for `MainWindow`."""
+
+import webbrowser
+from typing import TYPE_CHECKING
+
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
+    QFrame,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QStyle,
+    QVBoxLayout,
+)
+
+from session_sniffer.constants._build_info import COMMIT_DATE, COMMIT_SHA, OS_INFO, PYSIDE6_VERSION, RELEASE_DATE, RELEASE_TAG
+from session_sniffer.constants.local import (
+    APP_DIR_LOCAL,
+    APP_DIR_ROAMING,
+    CRASH_LOG_PATH,
+    DEBUG_DIR_PATH,
+    DEBUG_LOG_PATH,
+    DETECTION_LOGGING_PATH,
+    LOGGING_DIR_PATH,
+    PROTECTION_LOGGING_PATH,
+    SESSIONS_LOGGING_DIR_PATH,
+    SETTINGS_PATH,
+    USER_SCRIPTS_DIR_PATH,
+    USERIP_DATABASES_DIR_PATH,
+    USERIP_LOGGING_PATH,
+    VERSION,
+)
+from session_sniffer.constants.standalone import (
+    DISCORD_INVITE_URL,
+    GITHUB_ISSUES_URL,
+    GITHUB_LICENSE_URL,
+    BTX_UPDATES_CONFIGURED,
+    GITHUB_RELEASES_URL,
+    GITHUB_REPO_URL,
+    GITHUB_WIKI_TIPS_URL,
+    GITHUB_WIKI_URL,
+    LOOKY_BASE_HOST,
+    TITLE,
+)
+from session_sniffer.guis.detections_manager import DetectionsManagerDialog
+from session_sniffer.guis.interface_selection_dialog import InterfaceSelectionDialog
+from session_sniffer.guis.utils import activate_window, set_clipboard_text, show_or_focus_window
+from session_sniffer.settings import Settings
+from session_sniffer.updater import UpdateCheckOutcome, check_for_updates
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
+
+
+class FilesMixin(QMainWindow):
+    """File, folder, and URL open helpers mixin for `MainWindow`."""
+
+    _detections_manager_window: DetectionsManagerDialog | None
+    _on_open_hotspot: Callable[[], None]
+
+    def _open_detections_manager(self) -> None:
+        """Open the Detections Manager window, or focus the existing one."""
+        show_or_focus_window(self, '_detections_manager_window', lambda: DetectionsManagerDialog(None))
+
+    def _open_hotspot_manager(self) -> None:
+        """Open the Hotspot & Connection Sharing window, or focus the existing one."""
+        active_interface_dialog = InterfaceSelectionDialog.get_active_instance()
+        if active_interface_dialog is not None:
+            active_interface_dialog.select_hotspot_tab()
+            activate_window(active_interface_dialog)
+            return
+        self._on_open_hotspot()
+
+    def _open_looky_website(self) -> None:
+        """Open the Looky System website in the default browser."""
+        webbrowser.open(LOOKY_BASE_HOST)
+
+    def _open_project_repo(self) -> None:
+        """Open the GitHub repository in the default browser."""
+        webbrowser.open(GITHUB_REPO_URL)
+
+    def _open_documentation(self) -> None:
+        """Open the documentation URL in the default browser."""
+        webbrowser.open(GITHUB_WIKI_URL)
+
+    def _open_tips_and_tricks(self) -> None:
+        """Open the Tips and Tricks wiki page in the default browser."""
+        webbrowser.open(GITHUB_WIKI_TIPS_URL)
+
+    def _join_discord(self) -> None:
+        """Open the Discord invite URL in the default browser."""
+        webbrowser.open(DISCORD_INVITE_URL)
+
+    def _open_release_notes(self) -> None:
+        """Open the GitHub releases page in the default browser."""
+        webbrowser.open(GITHUB_RELEASES_URL)
+
+    def _view_license(self) -> None:
+        """Open the project license on GitHub in the default browser."""
+        webbrowser.open(GITHUB_LICENSE_URL)
+
+    def _report_issue(self) -> None:
+        """Open the GitHub issues page in the default browser."""
+        webbrowser.open(GITHUB_ISSUES_URL)
+
+    def _check_for_updates(self) -> None:
+        """Manually trigger an update check against GitHub."""
+        outcome, pending_download = check_for_updates(updater_channel=Settings.updater_channel)
+        if pending_download is not None:
+            pending_download()
+        elif not BTX_UPDATES_CONFIGURED:
+            QMessageBox.information(
+                self,
+                TITLE,
+                "Les mises à jour ne sont pas encore configurées.\n\nIndique ton dépôt GitHub dans BTX_GITHUB_REPO (fichier constants/standalone.py) puis recompile.",
+            )
+        elif outcome in (UpdateCheckOutcome.PROCEED, UpdateCheckOutcome.IGNORE):
+            QMessageBox.information(
+                self,
+                TITLE,
+                'Tu as la dernière version.',
+            )
+
+    @staticmethod
+    def open_directory(directory_path: Path) -> None:
+        """Ensure a directory exists and open it in the default file manager."""
+        directory_path.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory_path)))
+
+    @staticmethod
+    def open_file(file_path: Path) -> None:
+        """Ensure a file path exists and open the file using the default association."""
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.touch(exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(file_path)))
+
+    def _open_local_appdata_folder(self) -> None:
+        """Open the Local AppData Session Sniffer directory."""
+        self.open_directory(APP_DIR_LOCAL)
+
+    def _open_roaming_appdata_folder(self) -> None:
+        """Open the Roaming AppData Session Sniffer directory."""
+        self.open_directory(APP_DIR_ROAMING)
+
+    def _open_userip_databases_folder(self) -> None:
+        """Open the UserIP databases directory."""
+        self.open_directory(USERIP_DATABASES_DIR_PATH)
+
+    def _open_sessions_logging_folder(self) -> None:
+        """Open the sessions logging directory."""
+        self.open_directory(SESSIONS_LOGGING_DIR_PATH)
+
+    def _open_user_scripts_folder(self) -> None:
+        """Open the user scripts directory."""
+        self.open_directory(USER_SCRIPTS_DIR_PATH)
+
+    def _open_settings_file(self) -> None:
+        """Open the Settings.ini file."""
+        self.open_file(SETTINGS_PATH)
+
+    def _open_userip_log_file(self) -> None:
+        """Open the UserIP_Logging.csv file."""
+        self.open_file(USERIP_LOGGING_PATH)
+
+    def _open_detection_log_file(self) -> None:
+        """Open the Detection_Logging.csv file."""
+        self.open_file(DETECTION_LOGGING_PATH)
+
+    def _open_protection_log_file(self) -> None:
+        """Open the Protection_Logging.csv file."""
+        self.open_file(PROTECTION_LOGGING_PATH)
+
+    def _open_debug_log_file(self) -> None:
+        """Open the debug.log file."""
+        self.open_file(DEBUG_LOG_PATH)
+
+    def _open_crash_log_file(self) -> None:
+        """Open the crash.log file."""
+        self.open_file(CRASH_LOG_PATH)
+
+    def _open_debug_logs_folder(self) -> None:
+        """Open the Debug logs directory."""
+        self.open_directory(DEBUG_DIR_PATH)
+
+    def _open_logging_folder(self) -> None:
+        """Open the Logging directory."""
+        self.open_directory(LOGGING_DIR_PATH)
+
+    def _show_about_dialog(self) -> None:
+        """Show the About dialog with version, build, and system info."""
+        copy_text = '\n'.join(
+            [
+                f'Version: {VERSION}',
+                '',
+                f'Release Tag: {RELEASE_TAG}',
+                f'Release Date: {RELEASE_DATE}',
+                f'Commit Sha: {COMMIT_SHA}',
+                f'Commit Date: {COMMIT_DATE}',
+                '',
+                f'PySide6 Version: {PYSIDE6_VERSION}',
+                f'OS Info: {OS_INFO}',
+            ],
+        )
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f'About {TITLE}')
+        dialog.setMinimumWidth(440)
+
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(6)
+
+        style = dialog.style()
+        if style:
+            icon_label = QLabel()
+            icon_label.setPixmap(style.standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation).pixmap(32, 32))
+            icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(icon_label)
+
+        title_label = QLabel(f'<b style="font-size:13pt">{TITLE}</b>')
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title_label)
+
+        desc_label = QLabel('Un sniffer de paquets conçu pour les jeux vidéo Peer-To-Peer (P2P) sur PC et consoles.')
+        desc_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        desc_label.setWordWrap(True)
+        layout.addWidget(desc_label)
+
+        layout.addSpacing(6)
+
+        build_header = QLabel('<b>Informations de build</b>')
+        layout.addWidget(build_header)
+        build_sep = QFrame()
+        build_sep.setFrameShape(QFrame.Shape.HLine)
+        build_sep.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(build_sep)
+        build_info = QLabel(
+            f'<table cellspacing="2"><tr><td><b>Version</b></td><td>&nbsp;&nbsp;{VERSION}</td></tr><tr><td style="padding-top:0px"></td></tr><tr><td><b>Tag de release</b></td><td>&nbsp;&nbsp;{RELEASE_TAG}</td></tr><tr><td><b>Date de release</b></td><td>&nbsp;&nbsp;{RELEASE_DATE}</td></tr><tr><td><b>SHA du commit</b></td><td>&nbsp;&nbsp;{COMMIT_SHA}</td></tr><tr><td><b>Date du commit</b></td><td>&nbsp;&nbsp;{COMMIT_DATE}</td></tr><tr><td style="padding-top:0px"></td></tr><tr><td><b>Version PySide6</b></td><td>&nbsp;&nbsp;{PYSIDE6_VERSION}</td></tr><tr><td><b>Système</b></td><td>&nbsp;&nbsp;{OS_INFO}</td></tr></table>',
+        )
+        build_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(build_info)
+
+        layout.addSpacing(8)
+
+        button_box = QDialogButtonBox()
+        copy_button = button_box.addButton('Copier les détails', QDialogButtonBox.ButtonRole.ActionRole)
+        button_box.addButton(QDialogButtonBox.StandardButton.Close)
+
+        if copy_button:
+            copy_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            copy_button.clicked.connect(lambda: set_clipboard_text(copy_text))
+
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        dialog.exec()

@@ -1,0 +1,1340 @@
+"""Pydantic model for Settings.ini validation and normalization.
+
+Replaces the manual per-field if/elif chain in Settings.load_from_settings_file().
+The model validates raw string values from the INI parser and normalizes them
+into their runtime Python types, while tracking which fields need rewriting.
+
+The INI parser produces a dict[str, str] of UPPER_CASE key → raw string value.
+This model validates each field and records canonical rewrite intent via context.
+"""
+
+# pylint: disable=too-many-lines
+
+import ast
+from dataclasses import dataclass
+from typing import Any, ClassVar, Self, cast
+
+from pydantic import BaseModel, ConfigDict, ValidationInfo, field_validator, model_validator
+from PySide6.QtGui import QColor
+
+from session_sniffer.constants.standalone import (
+    CAPTURE_FILTER_BLOCK_SETTINGS,
+    DEFAULT_DETECTED_SERVER_COLOR,
+    MAX_PORT,
+    MIN_PORT,
+    WEBSERVER_DEFAULT_HOST,
+)
+from session_sniffer.networking.ip_range import parse_ip_range
+from session_sniffer.networking.utils import format_mac_address, is_ipv4_address, is_mac_address
+from session_sniffer.utils import (
+    check_case_insensitive_and_exact_match,
+    custom_str_to_bool,
+    custom_str_to_nonetype,
+    validate_and_strip_balanced_outer_parens,
+)
+from session_sniffer.utils_exceptions import InvalidBooleanValueError, InvalidNoneTypeValueError, NoMatchFoundError
+
+
+@dataclass(slots=True)
+class SettingsValidationConfig:
+    """Bundled configuration parameters for `SettingsIniModel.validate_and_get_rewrites`."""
+
+    defaults: dict[str, Any]
+    all_setting_names: tuple[str, ...]
+    toggleable_connected_columns: tuple[str, ...]
+    toggleable_disconnected_columns: tuple[str, ...]
+    all_connected_columns: tuple[str, ...]
+    all_disconnected_columns: tuple[str, ...]
+    all_third_party_servers: tuple[str, ...]
+    max_gui_table_rows_per_page: int
+    min_gui_disconnected_players_timer: int
+
+
+@dataclass(slots=True)
+class _ValidatorContext:
+    defaults: dict[str, Any]
+    ini_rewrites: dict[str, str]
+    flags: dict[str, Any]
+    toggleable_connected_columns: tuple[str, ...]
+    toggleable_disconnected_columns: tuple[str, ...]
+    all_connected_columns: tuple[str, ...]
+    all_disconnected_columns: tuple[str, ...]
+    all_third_party_servers: tuple[str, ...]
+    max_gui_table_rows_per_page: int
+    min_gui_disconnected_players_timer: int
+
+
+class SettingsIniModel(BaseModel):
+    """Pydantic model representing validated Settings.ini values."""
+
+    model_config = ConfigDict(extra='allow', strict=True, arbitrary_types_allowed=True)
+
+    # Capture settings
+    CAPTURE_INTERFACE_NAME: str | None
+    CAPTURE_IP_ADDRESS: str | None
+    CAPTURE_MAC_ADDRESS: str | None
+    CAPTURE_ARP_SPOOFING: bool
+    CAPTURE_BLOCK_THIRD_PARTY_SERVERS: tuple[str, ...]
+    CAPTURE_FEATURE_SET: str | None
+    CAPTURE_FILTER_PROCESS_PID: int
+    CAPTURE_OVERFLOW_TIMER: int
+    CAPTURE_PS3_NAME_RESOLVER: bool
+    CAPTURE_PREPEND_CUSTOM_CAPTURE_FILTER: str | None
+    CAPTURE_BLOCKED_IPS: tuple[str, ...]
+    CAPTURE_FILTERED_ISPS: tuple[str, ...]
+    CAPTURE_FILTER_BLOCK_RTCP: bool
+    CAPTURE_FILTER_BLOCK_SSDP: bool
+    CAPTURE_FILTER_BLOCK_RAKNET: bool
+    CAPTURE_FILTER_BLOCK_DTLS: bool
+    CAPTURE_FILTER_BLOCK_UAUDP: bool
+    CAPTURE_FILTER_BLOCK_CLASSICSTUN: bool
+    CAPTURE_FILTER_BLOCK_LLMNR: bool
+
+    # GUI settings
+    GUI_ALWAYS_ON_TOP: bool
+    GUI_REMEMBER_WINDOW_LAYOUT: bool
+    GUI_SERVERS_COLOR_ENABLED: bool
+    GUI_SERVERS_COLOR: str
+    GUI_INTERFACE_SELECTION_AUTO_CONNECT: bool
+    GUI_INTERFACE_SELECTION_HIDE_INACTIVE: bool
+    GUI_INTERFACE_SELECTION_HIDE_NEIGHBOURS: bool
+    GUI_SESSIONS_LOGGING: bool
+    GUI_SESSIONS_LOGGING_DELETE_EMPTY_FILES: bool
+    GUI_SESSIONS_LOGGING_DELETE_EMPTY_FOLDERS: bool
+    GUI_RESET_PORTS_ON_REJOINS: bool
+    GUI_SESSION_HOST_DETECTION: bool
+    GUI_SESSION_HOST_ICON: bool
+    GUI_COLUMNS_CONNECTED_SHOWN: tuple[str, ...]
+    GUI_COLUMNS_DISCONNECTED_SHOWN: tuple[str, ...]
+    GUI_COLUMNS_DATETIME_SHOW_DATE: bool
+    GUI_COLUMNS_DATETIME_SHOW_TIME: bool
+    GUI_COLUMNS_DATETIME_SHOW_ELAPSED_TIME: bool
+    GUI_COLUMNS_TIMEZONE_DISPLAY: str
+    GUI_COLUMNS_GEO_COUNTRY_APPEND_ALPHA2: bool
+    GUI_COLUMNS_GEO_CONTINENT_APPEND_ALPHA2: bool
+    GUI_CONNECTED_TABLE_ROWS_PER_PAGE: int
+    GUI_CONNECTED_TABLE_SORT_COLUMN: str
+    GUI_CONNECTED_TABLE_SORT_ORDER: str
+    GUI_DISCONNECTED_PLAYERS_ENABLED: bool
+    GUI_DISCONNECTED_TABLE_ROWS_PER_PAGE: int
+    GUI_DISCONNECTED_TABLE_SORT_COLUMN: str
+    GUI_DISCONNECTED_TABLE_SORT_ORDER: str
+    GUI_DISCONNECTED_PLAYERS_TIMER: int
+    GUI_IGNORE_SCREEN_RESOLUTION_WARNING: bool
+    VOICE_NOTIFICATIONS_ENABLED: bool
+
+    # Detection settings
+
+    # Discord / updater
+    DISCORD_PRESENCE: bool
+    DISCORD_PRESENCE_TITLE: str
+    SHOW_DISCORD_POPUP: bool
+    DISCORD_WEBHOOK_ENABLED: bool
+    DISCORD_WEBHOOK_URL: str | None
+    DISCORD_WEBHOOK_REFRESH_INTERVAL: int
+    DISCORD_WEBHOOK_INCLUDE_CONNECTED: bool
+    DISCORD_WEBHOOK_INCLUDE_DISCONNECTED: bool
+    DISCORD_WEBHOOK_MAX_ROWS_PER_TABLE: int
+    DISCORD_WEBHOOK_MAX_CONNECTED_PLAYERS: int
+    DISCORD_WEBHOOK_MAX_DISCONNECTED_PLAYERS: int
+    DISCORD_WEBHOOK_FORMAT: str
+    DISCORD_WEBHOOK_COLUMNS_CONNECTED: tuple[str, ...]
+    DISCORD_WEBHOOK_COLUMNS_DISCONNECTED: tuple[str, ...]
+    DISCORD_WEBHOOK_MESSAGE_IDS: str | None
+    WEBSERVER_ENABLED: bool
+    WEBSERVER_HOST: str
+    WEBSERVER_PORT: int
+    WEBSERVER_USERNAME: str | None
+    WEBSERVER_PASSWORD: str | None
+    UPDATER_CHANNEL: str | None
+    LOOKY_ENABLED: bool
+    LOOKY_EXCLUSIVE_GTA5_PROCESS: bool
+    LOOKY_GAME_VERSION: str
+    LOOKY_API_KEY: str | None
+    PINGER_LOCAL: bool
+    SOLO_SESSION_DURATION: int
+    HIGH_RATE_MONITOR_ICON: bool
+    HIGH_RATE_MONITOR_RUN_IN_BACKGROUND: bool
+    HIGH_RATE_MONITOR_AUTO_SELECT: bool
+    HIGH_RATE_MONITOR_PPS_THRESHOLD: int
+    HIGH_RATE_MONITOR_BPS_THRESHOLD: int
+    HIGH_RATE_MONITOR_DURATION_THRESHOLD: int
+    PLAYER_IDENTIFIER_ICON: bool
+    PLAYER_IDENTIFIER_SPIKE_ZSCORE: float
+    PLAYER_IDENTIFIER_SPIKE_SECONDS: int
+    PLAYER_IDENTIFIER_BASELINE_SECONDS: int
+    PLAYER_IDENTIFIER_CONTAMINATION_ZSCORE: float
+    PLAYER_IDENTIFIER_CONTAMINATION_SECONDS: int
+    PLAYER_IDENTIFIER_CONTAMINATION_MIN_SAMPLES: int
+    PLAYER_IDENTIFIER_BASELINE_TIMEOUT: int
+    PLAYER_IDENTIFIER_SESSION_DRIFT_ZSCORE: float
+
+    # --- Internal context helpers ---
+
+    _BOOL_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            'CAPTURE_ARP_SPOOFING',
+            'CAPTURE_PS3_NAME_RESOLVER',
+            *CAPTURE_FILTER_BLOCK_SETTINGS,
+            'DISCORD_PRESENCE',
+            'DISCORD_WEBHOOK_ENABLED',
+            'DISCORD_WEBHOOK_INCLUDE_CONNECTED',
+            'DISCORD_WEBHOOK_INCLUDE_DISCONNECTED',
+            'WEBSERVER_ENABLED',
+            'GUI_ALWAYS_ON_TOP',
+            'GUI_REMEMBER_WINDOW_LAYOUT',
+            'GUI_SERVERS_COLOR_ENABLED',
+            'GUI_COLUMNS_DATETIME_SHOW_DATE',
+            'GUI_COLUMNS_DATETIME_SHOW_ELAPSED_TIME',
+            'GUI_COLUMNS_DATETIME_SHOW_TIME',
+            'GUI_COLUMNS_GEO_CONTINENT_APPEND_ALPHA2',
+            'GUI_COLUMNS_GEO_COUNTRY_APPEND_ALPHA2',
+            'GUI_INTERFACE_SELECTION_AUTO_CONNECT',
+            'GUI_INTERFACE_SELECTION_HIDE_INACTIVE',
+            'GUI_INTERFACE_SELECTION_HIDE_NEIGHBOURS',
+            'GUI_RESET_PORTS_ON_REJOINS',
+            'GUI_SESSION_HOST_DETECTION',
+            'GUI_SESSION_HOST_ICON',
+            'GUI_SESSIONS_LOGGING',
+            'GUI_SESSIONS_LOGGING_DELETE_EMPTY_FILES',
+            'GUI_SESSIONS_LOGGING_DELETE_EMPTY_FOLDERS',
+            'GUI_DISCONNECTED_PLAYERS_ENABLED',
+            'GUI_IGNORE_SCREEN_RESOLUTION_WARNING',
+            'LOOKY_ENABLED',
+            'LOOKY_EXCLUSIVE_GTA5_PROCESS',
+            'PINGER_LOCAL',
+            'SHOW_DISCORD_POPUP',
+            'VOICE_NOTIFICATIONS_ENABLED',
+            'HIGH_RATE_MONITOR_ICON',
+            'HIGH_RATE_MONITOR_RUN_IN_BACKGROUND',
+            'HIGH_RATE_MONITOR_AUTO_SELECT',
+            'PLAYER_IDENTIFIER_ICON',
+        },
+    )
+
+    @staticmethod
+    def _get_context(info: ValidationInfo) -> _ValidatorContext | None:
+        if not isinstance(info.context, _ValidatorContext):
+            return None
+        return info.context
+
+    @classmethod
+    def _get_default_for_field(cls, info: ValidationInfo) -> object:
+        context = cls._get_context(info)
+        if context is None:
+            return None
+        if not isinstance(info.field_name, str):
+            return None
+        return context.defaults.get(info.field_name)
+
+    @staticmethod
+    def _record_rewrite(info: ValidationInfo, rewrite_to: str | None) -> None:
+        if rewrite_to is None:
+            return
+        if not isinstance(info.context, _ValidatorContext):
+            return
+        if not isinstance(info.field_name, str):
+            return
+        info.context.ini_rewrites[info.field_name] = rewrite_to
+
+    @staticmethod
+    def _set_flag(info: ValidationInfo, flag_name: str, *, value: object) -> None:
+        if not isinstance(info.context, _ValidatorContext):
+            return
+        info.context.flags[flag_name] = value
+
+    # --- Validators ---
+
+    @field_validator(*_BOOL_FIELDS, mode='before')
+    @classmethod
+    def _normalize_bool_fields(cls, value: object, info: ValidationInfo) -> bool:
+        """Parse boolean-like INI tokens and record canonical rewrites when needed."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            try:
+                resolved, need_rewrite = custom_str_to_bool(value)
+            except InvalidBooleanValueError:
+                default_value = cls._get_default_for_field(info)
+                if isinstance(default_value, bool):
+                    cls._set_flag(info, 'should_rewrite', value=True)
+                    return default_value
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return False
+            if need_rewrite:
+                cls._record_rewrite(info, str(resolved))
+            return resolved
+        default_value = cls._get_default_for_field(info)
+        if isinstance(default_value, bool):
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_value
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return False
+
+    @field_validator('CAPTURE_INTERFACE_NAME', mode='before')
+    @classmethod
+    def _parse_interface_name(cls, value: object, info: ValidationInfo) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                none_value, need_rewrite = custom_str_to_nonetype(value)
+            except InvalidNoneTypeValueError:
+                return value
+            if need_rewrite:
+                cls._record_rewrite(info, 'None')
+            return none_value
+        return cast('str | None', cls._get_default_for_field(info))
+
+    @field_validator('CAPTURE_IP_ADDRESS', mode='before')
+    @classmethod
+    def _parse_ip_address(cls, value: object, info: ValidationInfo) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                none_value, need_rewrite = custom_str_to_nonetype(value)
+            except InvalidNoneTypeValueError:
+                if is_ipv4_address(value):
+                    return value
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return cast('str | None', cls._get_default_for_field(info))
+            if need_rewrite:
+                cls._record_rewrite(info, 'None')
+            return none_value
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return cast('str | None', cls._get_default_for_field(info))
+
+    @field_validator('CAPTURE_MAC_ADDRESS', mode='before')
+    @classmethod
+    def _parse_mac_address(cls, value: object, info: ValidationInfo) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                none_value, need_rewrite = custom_str_to_nonetype(value)
+            except InvalidNoneTypeValueError:
+                formatted = format_mac_address(value)
+                if is_mac_address(formatted):
+                    if formatted != value:
+                        cls._record_rewrite(info, formatted)
+                    return formatted
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return cast('str | None', cls._get_default_for_field(info))
+            if need_rewrite:
+                cls._record_rewrite(info, 'None')
+            return none_value
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return cast('str | None', cls._get_default_for_field(info))
+
+    @field_validator('CAPTURE_BLOCK_THIRD_PARTY_SERVERS', mode='before')
+    @classmethod
+    def _parse_block_servers(cls, value: object, info: ValidationInfo) -> tuple[str, ...]:
+        context = cls._get_context(info)
+        all_servers: tuple[str, ...] = () if context is None else context.all_third_party_servers
+
+        if isinstance(value, tuple):
+            return cast('tuple[str, ...]', value)
+        if isinstance(value, str):
+            normalized, need_rewrite_current, need_rewrite_settings = _normalize_tuple_column(value, all_servers)
+            if need_rewrite_current:
+                cls._record_rewrite(info, str(normalized) if normalized is not None else str(cls._get_default_for_field(info)))
+            if need_rewrite_settings:
+                cls._set_flag(info, 'should_rewrite', value=True)
+            return normalized if normalized is not None else cast('tuple[str, ...]', cls._get_default_for_field(info) or ())
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return cast('tuple[str, ...]', cls._get_default_for_field(info) or ())
+
+    @field_validator('CAPTURE_BLOCKED_IPS', mode='before')
+    @classmethod
+    def _parse_blocked_ips(cls, value: object, info: ValidationInfo) -> tuple[str, ...]:
+        if isinstance(value, tuple):
+            return cast('tuple[str, ...]', value)
+        if isinstance(value, str):
+            try:
+                parsed: object = ast.literal_eval(value)
+            except ValueError, SyntaxError, RecursionError, MemoryError:
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return ()
+            if not isinstance(parsed, tuple):
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return ()
+            if not all(isinstance(item, str) for item in cast('tuple[str | int, ...]', parsed)):
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return ()
+            valid_items: list[str] = []
+            need_rewrite = False
+            for item in cast('tuple[str, ...]', parsed):
+                try:
+                    parse_ip_range(item)
+                    valid_items.append(item)
+                except ValueError:
+                    need_rewrite = True
+            if need_rewrite:
+                cls._set_flag(info, 'should_rewrite', value=True)
+            return tuple(valid_items)
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return ()
+
+    @field_validator('CAPTURE_FILTERED_ISPS', mode='before')
+    @classmethod
+    def _parse_filtered_isps(cls, value: object, info: ValidationInfo) -> tuple[str, ...]:
+        if isinstance(value, tuple):
+            return cast('tuple[str, ...]', value)
+        if isinstance(value, str):
+            try:
+                parsed: object = ast.literal_eval(value)
+            except ValueError, SyntaxError, RecursionError, MemoryError:
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return ()
+            if not isinstance(parsed, tuple):
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return ()
+            valid_items: list[str] = []
+            need_rewrite = False
+            for item in cast('tuple[object, ...]', parsed):
+                if isinstance(item, str) and (stripped := item.strip()):
+                    if stripped != item:
+                        need_rewrite = True
+                    valid_items.append(stripped)
+                else:
+                    need_rewrite = True
+            if need_rewrite:
+                cls._set_flag(info, 'should_rewrite', value=True)
+            return tuple(valid_items)
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return ()
+
+    @field_validator('CAPTURE_FEATURE_SET', mode='before')
+    @classmethod
+    def _parse_feature_set(cls, value: object, info: ValidationInfo) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                none_value, need_rewrite = custom_str_to_nonetype(value)
+            except InvalidNoneTypeValueError:
+                try:
+                    case_match, normalized = check_case_insensitive_and_exact_match(value, ('GTA V', 'RDR2'))
+                except NoMatchFoundError:
+                    cls._set_flag(info, 'should_rewrite', value=True)
+                    return cast('str | None', cls._get_default_for_field(info))
+                if not case_match:
+                    cls._record_rewrite(info, normalized)
+                return normalized
+            if need_rewrite:
+                cls._record_rewrite(info, 'None')
+            return none_value
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return cast('str | None', cls._get_default_for_field(info))
+
+    @field_validator('CAPTURE_OVERFLOW_TIMER', mode='before')
+    @classmethod
+    def _parse_overflow_timer(cls, value: object, info: ValidationInfo) -> int:
+        if isinstance(value, (int, float)):
+            return int(value) if value >= 0 else cast('int', cls._get_default_for_field(info) or 3)
+        if isinstance(value, str):
+            try:
+                parsed = int(float(value))
+            except ValueError:
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return cast('int', cls._get_default_for_field(info) or 3)
+            if parsed >= 0:
+                return parsed
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return cast('int', cls._get_default_for_field(info) or 3)
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return cast('int', cls._get_default_for_field(info) or 3)
+
+    @field_validator('CAPTURE_FILTER_PROCESS_PID', mode='before')
+    @classmethod
+    def _parse_filter_process_pid(cls, value: object, info: ValidationInfo) -> int:
+        if isinstance(value, (int, float)):
+            return int(value) if value >= 0 else cast('int', cls._get_default_for_field(info) or 0)
+        if isinstance(value, str):
+            try:
+                parsed = int(float(value))
+            except ValueError:
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return cast('int', cls._get_default_for_field(info) or 0)
+            if parsed >= 0:
+                return parsed
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return cast('int', cls._get_default_for_field(info) or 0)
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return cast('int', cls._get_default_for_field(info) or 0)
+
+    @field_validator('CAPTURE_PREPEND_CUSTOM_CAPTURE_FILTER', mode='before')
+    @classmethod
+    def _parse_custom_filter(cls, value: object, info: ValidationInfo) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                none_value, need_rewrite = custom_str_to_nonetype(value)
+            except InvalidNoneTypeValueError:
+                stripped = validate_and_strip_balanced_outer_parens(value)
+                if value != stripped:
+                    cls._set_flag(info, 'should_rewrite', value=True)
+                return stripped
+            if need_rewrite:
+                cls._record_rewrite(info, 'None')
+            return none_value
+        return cast('str | None', cls._get_default_for_field(info))
+
+    @field_validator('GUI_COLUMNS_CONNECTED_SHOWN', mode='before')
+    @classmethod
+    def _parse_connected_shown(cls, value: object, info: ValidationInfo) -> tuple[str, ...]:
+        context = cls._get_context(info)
+        allowed: tuple[str, ...] = () if context is None else context.toggleable_connected_columns
+        return cls._parse_shown_columns(value, allowed, info)
+
+    @field_validator('GUI_COLUMNS_DISCONNECTED_SHOWN', mode='before')
+    @classmethod
+    def _parse_disconnected_shown(cls, value: object, info: ValidationInfo) -> tuple[str, ...]:
+        context = cls._get_context(info)
+        allowed: tuple[str, ...] = () if context is None else context.toggleable_disconnected_columns
+        return cls._parse_shown_columns(value, allowed, info)
+
+    @field_validator('DISCORD_WEBHOOK_COLUMNS_CONNECTED', mode='before')
+    @classmethod
+    def _parse_webhook_columns_connected(cls, value: object, info: ValidationInfo) -> tuple[str, ...]:
+        context = cls._get_context(info)
+        allowed: tuple[str, ...] = () if context is None else context.all_connected_columns
+        return cls._parse_shown_columns(value, allowed, info)
+
+    @field_validator('DISCORD_WEBHOOK_COLUMNS_DISCONNECTED', mode='before')
+    @classmethod
+    def _parse_webhook_columns_disconnected(cls, value: object, info: ValidationInfo) -> tuple[str, ...]:
+        context = cls._get_context(info)
+        allowed: tuple[str, ...] = () if context is None else context.all_disconnected_columns
+        return cls._parse_shown_columns(value, allowed, info)
+
+    @classmethod
+    def _parse_shown_columns(cls, value: object, allowed: tuple[str, ...], info: ValidationInfo) -> tuple[str, ...]:
+        if isinstance(value, tuple):
+            return cast('tuple[str, ...]', value)
+        if isinstance(value, str):
+            normalized, need_rewrite_current, need_rewrite_settings = _normalize_tuple_column(value, allowed)
+            if need_rewrite_current:
+                cls._record_rewrite(info, str(normalized) if normalized is not None else str(cls._get_default_for_field(info)))
+            if need_rewrite_settings:
+                cls._set_flag(info, 'should_rewrite', value=True)
+            return normalized if normalized is not None else cast('tuple[str, ...]', cls._get_default_for_field(info) or ())
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return cast('tuple[str, ...]', cls._get_default_for_field(info) or ())
+
+    @field_validator('GUI_CONNECTED_TABLE_ROWS_PER_PAGE', 'GUI_DISCONNECTED_TABLE_ROWS_PER_PAGE', mode='before')
+    @classmethod
+    def _parse_rows_per_page(cls, value: object, info: ValidationInfo) -> int:
+        max_rpp = 5000  # Settings.MAX_GUI_TABLE_ROWS_PER_PAGE
+        context = cls._get_context(info)
+        if context is not None:
+            max_rpp = context.max_gui_table_rows_per_page
+
+        if isinstance(value, int):
+            if 0 <= value <= max_rpp:
+                return value
+            cls._set_flag(info, 'should_rewrite', value=True)
+            default = cls._get_default_for_field(info)
+            return default if isinstance(default, int) else 0
+        if isinstance(value, str):
+            try:
+                parsed = int(float(value))
+            except ValueError:
+                cls._set_flag(info, 'should_rewrite', value=True)
+                default = cls._get_default_for_field(info)
+                return default if isinstance(default, int) else 0
+            if 0 <= parsed <= max_rpp:
+                return parsed
+            cls._set_flag(info, 'should_rewrite', value=True)
+            default = cls._get_default_for_field(info)
+            return default if isinstance(default, int) else 0
+        cls._set_flag(info, 'should_rewrite', value=True)
+        default = cls._get_default_for_field(info)
+        return default if isinstance(default, int) else 0
+
+    @field_validator('WEBSERVER_PORT', mode='before')
+    @classmethod
+    def _parse_webserver_port(cls, value: object, info: ValidationInfo) -> int:
+        default = cls._get_default_for_field(info)
+        default_int = default if isinstance(default, int) else 80
+
+        if isinstance(value, bool):
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_int
+
+        if isinstance(value, int):
+            port = value
+        elif isinstance(value, float):
+            port = int(value)
+        elif isinstance(value, str):
+            try:
+                port = int(value)
+            except ValueError:
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return default_int
+        else:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_int
+
+        if MIN_PORT <= port <= MAX_PORT:
+            return port
+
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return default_int
+
+    @field_validator('WEBSERVER_HOST', mode='before')
+    @classmethod
+    def _parse_webserver_host(cls, value: object, info: ValidationInfo) -> str:
+        default = cls._get_default_for_field(info)
+        default_str = default if isinstance(default, str) else WEBSERVER_DEFAULT_HOST
+        if isinstance(value, str) and is_ipv4_address(value):
+            return value
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return default_str
+
+    @field_validator('GUI_DISCONNECTED_PLAYERS_TIMER', mode='before')
+    @classmethod
+    def _parse_disconnected_timer(cls, value: object, info: ValidationInfo) -> int:
+        min_timer = 3  # Settings.MIN_GUI_DISCONNECTED_PLAYERS_TIMER_SECONDS
+        context = cls._get_context(info)
+        if context is not None:
+            min_timer = context.min_gui_disconnected_players_timer
+
+        if isinstance(value, (int, float)):
+            int_value = int(value)
+            if int_value >= min_timer:
+                return int_value
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return cast('int', cls._get_default_for_field(info) or 10)
+        if isinstance(value, str):
+            try:
+                parsed = int(float(value))
+            except ValueError:
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return cast('int', cls._get_default_for_field(info) or 10)
+            if parsed >= min_timer:
+                return parsed
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return cast('int', cls._get_default_for_field(info) or 10)
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return cast('int', cls._get_default_for_field(info) or 10)
+
+    @field_validator('DISCORD_PRESENCE_TITLE', mode='before')
+    @classmethod
+    def _parse_discord_presence_title(cls, value: object, info: ValidationInfo) -> str:
+        if isinstance(value, str) and len(value) == 1:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            default_value = cls._get_default_for_field(info)
+            return default_value if isinstance(default_value, str) else ''
+        if isinstance(value, str):
+            return value
+        cls._set_flag(info, 'should_rewrite', value=True)
+        default_value = cls._get_default_for_field(info)
+        return default_value if isinstance(default_value, str) else ''
+
+    @field_validator('GUI_SERVERS_COLOR', mode='before')
+    @classmethod
+    def _parse_gui_servers_color(cls, value: object, info: ValidationInfo) -> str:
+        if isinstance(value, str) and QColor(value).isValid():
+            return value
+        cls._set_flag(info, 'should_rewrite', value=True)
+        default_val = cls._get_default_for_field(info)
+        return str(default_val) if default_val is not None else DEFAULT_DETECTED_SERVER_COLOR
+
+    @field_validator('DISCORD_WEBHOOK_URL', 'DISCORD_WEBHOOK_MESSAGE_IDS', 'WEBSERVER_USERNAME', 'WEBSERVER_PASSWORD', 'LOOKY_API_KEY', mode='before')
+    @classmethod
+    def _parse_optional_string(cls, value: object, info: ValidationInfo) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                none_value, need_rewrite = custom_str_to_nonetype(value)
+            except InvalidNoneTypeValueError:
+                return value
+            if need_rewrite:
+                cls._record_rewrite(info, 'None')
+            return none_value
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return cast('str | None', cls._get_default_for_field(info))
+
+    @field_validator('DISCORD_WEBHOOK_REFRESH_INTERVAL', mode='before')
+    @classmethod
+    def _parse_webhook_refresh_interval(cls, value: object, info: ValidationInfo) -> int:
+        min_val = 5
+        max_val = 300
+        default = cls._get_default_for_field(info)
+        default_int = default if isinstance(default, int) else 15
+
+        parsed: int | None = None
+        if isinstance(value, (int, float)):
+            parsed = int(value)
+        elif isinstance(value, str):
+            try:
+                parsed = int(float(value))
+            except ValueError:
+                parsed = None
+
+        if parsed is None:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_int
+        if parsed < min_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return min_val
+        if parsed > max_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return max_val
+        return parsed
+
+    @field_validator('SOLO_SESSION_DURATION', mode='before')
+    @classmethod
+    def _parse_solo_session_duration(cls, value: object, info: ValidationInfo) -> int:
+        min_val = 6
+        max_val = 60
+        default = cls._get_default_for_field(info)
+        default_int = default if isinstance(default, int) else 6
+
+        parsed: int | None = None
+        if isinstance(value, (int, float)):
+            parsed = int(value)
+        elif isinstance(value, str):
+            try:
+                parsed = int(float(value))
+            except ValueError:
+                parsed = None
+
+        if parsed is None:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_int
+        if parsed < min_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return min_val
+        if parsed > max_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return max_val
+        return parsed
+
+    @field_validator('HIGH_RATE_MONITOR_PPS_THRESHOLD', mode='before')
+    @classmethod
+    def _parse_high_rate_monitor_pps_threshold(cls, value: object, info: ValidationInfo) -> int:
+        min_val = 20
+        max_val = 50
+        default = cls._get_default_for_field(info)
+        default_int = default if isinstance(default, int) else 30
+
+        parsed: int | None = None
+        if isinstance(value, (int, float)):
+            parsed = int(value)
+        elif isinstance(value, str):
+            try:
+                parsed = int(float(value))
+            except ValueError:
+                parsed = None
+
+        if parsed is None:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_int
+        if parsed < min_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return min_val
+        if parsed > max_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return max_val
+        return parsed
+
+    @field_validator('HIGH_RATE_MONITOR_BPS_THRESHOLD', mode='before')
+    @classmethod
+    def _parse_high_rate_monitor_bps_threshold(cls, value: object, info: ValidationInfo) -> int:
+        min_val = 3
+        max_val = 500
+        default = cls._get_default_for_field(info)
+        default_int = default if isinstance(default, int) else 5
+
+        parsed: int | None = None
+        if isinstance(value, (int, float)):
+            parsed = int(value)
+        elif isinstance(value, str):
+            try:
+                parsed = int(float(value))
+            except ValueError:
+                parsed = None
+
+        if parsed is None:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_int
+        if parsed < min_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return min_val
+        if parsed > max_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return max_val
+        return parsed
+
+    @field_validator('HIGH_RATE_MONITOR_DURATION_THRESHOLD', mode='before')
+    @classmethod
+    def _parse_high_rate_monitor_duration_threshold(cls, value: object, info: ValidationInfo) -> int:
+        min_val = 1
+        max_val = 10
+        default = cls._get_default_for_field(info)
+        default_int = default if isinstance(default, int) else 3
+
+        parsed: int | None = None
+        if isinstance(value, (int, float)):
+            parsed = int(value)
+        elif isinstance(value, str):
+            try:
+                parsed = int(float(value))
+            except ValueError:
+                parsed = None
+
+        if parsed is None:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_int
+        if parsed < min_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return min_val
+        if parsed > max_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return max_val
+        return parsed
+
+    @field_validator('PLAYER_IDENTIFIER_SPIKE_ZSCORE', mode='before')
+    @classmethod
+    def _parse_player_identifier_spike_zscore(cls, value: object, info: ValidationInfo) -> float:
+        min_val = 1.0
+        max_val = 20.0
+        default = cls._get_default_for_field(info)
+        default_float = default if isinstance(default, float) else 3.0
+
+        parsed: float | None = None
+        if isinstance(value, (int, float)):
+            parsed = float(value)
+        elif isinstance(value, str):
+            try:
+                parsed = float(value)
+            except ValueError:
+                parsed = None
+
+        if parsed is None:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_float
+        if parsed < min_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return min_val
+        if parsed > max_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return max_val
+        return parsed
+
+    @field_validator('PLAYER_IDENTIFIER_SPIKE_SECONDS', mode='before')
+    @classmethod
+    def _parse_player_identifier_spike_seconds(cls, value: object, info: ValidationInfo) -> int:
+        min_val = 1
+        max_val = 30
+        default = cls._get_default_for_field(info)
+        default_int = default if isinstance(default, int) else 3
+
+        parsed: int | None = None
+        if isinstance(value, (int, float)):
+            parsed = int(value)
+        elif isinstance(value, str):
+            try:
+                parsed = int(float(value))
+            except ValueError:
+                parsed = None
+
+        if parsed is None:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_int
+        if parsed < min_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return min_val
+        if parsed > max_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return max_val
+        return parsed
+
+    @field_validator('PLAYER_IDENTIFIER_BASELINE_SECONDS', mode='before')
+    @classmethod
+    def _parse_player_identifier_baseline_seconds(cls, value: object, info: ValidationInfo) -> int:
+        min_val = 5
+        max_val = 120
+        default = cls._get_default_for_field(info)
+        default_int = default if isinstance(default, int) else 10
+
+        parsed: int | None = None
+        if isinstance(value, (int, float)):
+            parsed = int(value)
+        elif isinstance(value, str):
+            try:
+                parsed = int(float(value))
+            except ValueError:
+                parsed = None
+
+        if parsed is None:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_int
+        if parsed < min_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return min_val
+        if parsed > max_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return max_val
+        return parsed
+
+    @field_validator('PLAYER_IDENTIFIER_CONTAMINATION_ZSCORE', mode='before')
+    @classmethod
+    def _parse_player_identifier_contamination_zscore(cls, value: object, info: ValidationInfo) -> float:
+        min_val = 3.0
+        max_val = 50.0
+        default = cls._get_default_for_field(info)
+        default_float = default if isinstance(default, float) else 10.0
+
+        parsed: float | None = None
+        if isinstance(value, (int, float)):
+            parsed = float(value)
+        elif isinstance(value, str):
+            try:
+                parsed = float(value)
+            except ValueError:
+                parsed = None
+
+        if parsed is None:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_float
+        if parsed < min_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return min_val
+        if parsed > max_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return max_val
+        return parsed
+
+    @field_validator('PLAYER_IDENTIFIER_CONTAMINATION_SECONDS', mode='before')
+    @classmethod
+    def _parse_player_identifier_contamination_seconds(cls, value: object, info: ValidationInfo) -> int:
+        min_val = 1
+        max_val = 30
+        default = cls._get_default_for_field(info)
+        default_int = default if isinstance(default, int) else 5
+
+        parsed: int | None = None
+        if isinstance(value, (int, float)):
+            parsed = int(value)
+        elif isinstance(value, str):
+            try:
+                parsed = int(float(value))
+            except ValueError:
+                parsed = None
+
+        if parsed is None:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_int
+        if parsed < min_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return min_val
+        if parsed > max_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return max_val
+        return parsed
+
+    @field_validator('PLAYER_IDENTIFIER_CONTAMINATION_MIN_SAMPLES', mode='before')
+    @classmethod
+    def _parse_player_identifier_contamination_min_samples(cls, value: object, info: ValidationInfo) -> int:
+        min_val = 5
+        max_val = 60
+        default = cls._get_default_for_field(info)
+        default_int = default if isinstance(default, int) else 15
+
+        parsed: int | None = None
+        if isinstance(value, (int, float)):
+            parsed = int(value)
+        elif isinstance(value, str):
+            try:
+                parsed = int(float(value))
+            except ValueError:
+                parsed = None
+
+        if parsed is None:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_int
+        if parsed < min_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return min_val
+        if parsed > max_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return max_val
+        return parsed
+
+    @field_validator('PLAYER_IDENTIFIER_BASELINE_TIMEOUT', mode='before')
+    @classmethod
+    def _parse_player_identifier_baseline_timeout(cls, value: object, info: ValidationInfo) -> int:
+        min_val = 10
+        max_val = 300
+        default = cls._get_default_for_field(info)
+        default_int = default if isinstance(default, int) else 30
+
+        parsed: int | None = None
+        if isinstance(value, (int, float)):
+            parsed = int(value)
+        elif isinstance(value, str):
+            try:
+                parsed = int(float(value))
+            except ValueError:
+                parsed = None
+
+        if parsed is None:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_int
+        if parsed < min_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return min_val
+        if parsed > max_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return max_val
+        return parsed
+
+    @field_validator('PLAYER_IDENTIFIER_SESSION_DRIFT_ZSCORE', mode='before')
+    @classmethod
+    def _parse_player_identifier_session_drift_zscore(cls, value: object, info: ValidationInfo) -> float:
+        min_val = 1.0
+        max_val = 30.0
+        default = cls._get_default_for_field(info)
+        default_float = default if isinstance(default, float) else 6.0
+
+        parsed: float | None = None
+        if isinstance(value, (int, float)):
+            parsed = float(value)
+        elif isinstance(value, str):
+            try:
+                parsed = float(value)
+            except ValueError:
+                parsed = None
+
+        if parsed is None:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_float
+        if parsed < min_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return min_val
+        if parsed > max_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return max_val
+        return parsed
+
+    @field_validator('DISCORD_WEBHOOK_MAX_ROWS_PER_TABLE', mode='before')
+    @classmethod
+    def _parse_webhook_max_rows(cls, value: object, info: ValidationInfo) -> int:
+        min_val = 1
+        max_val = 100
+        default = cls._get_default_for_field(info)
+        default_int = default if isinstance(default, int) else 25
+
+        parsed: int | None = None
+        if isinstance(value, (int, float)):
+            parsed = int(value)
+        elif isinstance(value, str):
+            try:
+                parsed = int(float(value))
+            except ValueError:
+                parsed = None
+
+        if parsed is None:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_int
+        if parsed < min_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return min_val
+        if parsed > max_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return max_val
+        return parsed
+
+    @field_validator('DISCORD_WEBHOOK_MAX_CONNECTED_PLAYERS', 'DISCORD_WEBHOOK_MAX_DISCONNECTED_PLAYERS', mode='before')
+    @classmethod
+    def _parse_webhook_max_players(cls, value: object, info: ValidationInfo) -> int:
+        min_val = 0  # 0 = All (unlimited)
+        max_val = 100
+        default = cls._get_default_for_field(info)
+        default_int = default if isinstance(default, int) else 0
+
+        parsed: int | None = None
+        if isinstance(value, (int, float)):
+            parsed = int(value)
+        elif isinstance(value, str):
+            try:
+                parsed = int(float(value))
+            except ValueError:
+                parsed = None
+
+        if parsed is None:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return default_int
+        if parsed < min_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return min_val
+        if parsed > max_val:
+            cls._set_flag(info, 'should_rewrite', value=True)
+            return max_val
+        return parsed
+
+    @field_validator('DISCORD_WEBHOOK_FORMAT', mode='before')
+    @classmethod
+    def _parse_webhook_format(cls, value: object, info: ValidationInfo) -> str:
+        if isinstance(value, str):
+            try:
+                case_match, normalized = check_case_insensitive_and_exact_match(value, ('Desktop', 'Mobile'))
+            except NoMatchFoundError:
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return cast('str', cls._get_default_for_field(info))
+            if not case_match:
+                cls._record_rewrite(info, normalized)
+            return normalized
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return cast('str', cls._get_default_for_field(info))
+
+    @field_validator('GUI_COLUMNS_TIMEZONE_DISPLAY', mode='before')
+    @classmethod
+    def _parse_timezone_display(cls, value: object, info: ValidationInfo) -> str:
+        if isinstance(value, str):
+            try:
+                case_match, normalized = check_case_insensitive_and_exact_match(
+                    value,
+                    ('Timezone', 'Timezone + Local Time', 'Local Time'),
+                )
+            except NoMatchFoundError:
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return cast('str', cls._get_default_for_field(info))
+            if not case_match:
+                cls._record_rewrite(info, normalized)
+            return normalized
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return cast('str', cls._get_default_for_field(info))
+
+    @field_validator('GUI_CONNECTED_TABLE_SORT_COLUMN', mode='before')
+    @classmethod
+    def _parse_connected_table_sort_column(cls, value: object, info: ValidationInfo) -> str:
+        context = cls._get_context(info)
+        allowed: tuple[str, ...] = () if context is None else context.all_connected_columns
+        if isinstance(value, str):
+            try:
+                case_match, normalized = check_case_insensitive_and_exact_match(value, allowed)
+            except NoMatchFoundError:
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return cast('str', cls._get_default_for_field(info))
+            if not case_match:
+                cls._record_rewrite(info, normalized)
+            return normalized
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return cast('str', cls._get_default_for_field(info))
+
+    @field_validator('GUI_DISCONNECTED_TABLE_SORT_COLUMN', mode='before')
+    @classmethod
+    def _parse_disconnected_table_sort_column(cls, value: object, info: ValidationInfo) -> str:
+        context = cls._get_context(info)
+        allowed: tuple[str, ...] = () if context is None else context.all_disconnected_columns
+        if isinstance(value, str):
+            try:
+                case_match, normalized = check_case_insensitive_and_exact_match(value, allowed)
+            except NoMatchFoundError:
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return cast('str', cls._get_default_for_field(info))
+            if not case_match:
+                cls._record_rewrite(info, normalized)
+            return normalized
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return cast('str', cls._get_default_for_field(info))
+
+    @field_validator('GUI_CONNECTED_TABLE_SORT_ORDER', 'GUI_DISCONNECTED_TABLE_SORT_ORDER', mode='before')
+    @classmethod
+    def _parse_table_sort_order(cls, value: object, info: ValidationInfo) -> str:
+        if isinstance(value, str):
+            try:
+                case_match, normalized = check_case_insensitive_and_exact_match(value, ('Ascending', 'Descending'))
+            except NoMatchFoundError:
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return cast('str', cls._get_default_for_field(info))
+            if not case_match:
+                cls._record_rewrite(info, normalized)
+            return normalized
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return cast('str', cls._get_default_for_field(info))
+
+    @field_validator('LOOKY_GAME_VERSION', mode='before')
+    @classmethod
+    def _parse_looky_game_version(cls, value: object, info: ValidationInfo) -> str:
+        if isinstance(value, str):
+            try:
+                case_match, normalized = check_case_insensitive_and_exact_match(value, ('Both', 'Legacy', 'Enhanced'))
+            except NoMatchFoundError:
+                cls._set_flag(info, 'should_rewrite', value=True)
+                return cast('str', cls._get_default_for_field(info))
+            if not case_match:
+                cls._record_rewrite(info, normalized)
+            return normalized
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return cast('str', cls._get_default_for_field(info))
+
+    @field_validator('UPDATER_CHANNEL', mode='before')
+    @classmethod
+    def _parse_updater_channel(cls, value: object, info: ValidationInfo) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                none_value, need_rewrite = custom_str_to_nonetype(value)
+            except InvalidNoneTypeValueError:
+                try:
+                    case_match, normalized = check_case_insensitive_and_exact_match(value, ('Stable', 'Pre-release'))
+                except NoMatchFoundError:
+                    cls._set_flag(info, 'should_rewrite', value=True)
+                    return cast('str | None', cls._get_default_for_field(info))
+                if not case_match:
+                    cls._record_rewrite(info, normalized)
+                return normalized
+            if need_rewrite:
+                cls._record_rewrite(info, 'None')
+            return none_value
+        cls._set_flag(info, 'should_rewrite', value=True)
+        return cast('str | None', cls._get_default_for_field(info))
+
+    @model_validator(mode='after')
+    def _check_datetime_columns(self, info: ValidationInfo) -> Self:
+        """Ensure at least one datetime column is enabled; reset all to defaults if not."""
+        if self.GUI_COLUMNS_DATETIME_SHOW_DATE is False and self.GUI_COLUMNS_DATETIME_SHOW_TIME is False and self.GUI_COLUMNS_DATETIME_SHOW_ELAPSED_TIME is False:
+            self._set_flag(info, 'invalid_datetime_columns_corrected', value=True)
+            self._set_flag(info, 'should_rewrite', value=True)
+            context = self._get_context(info)
+            if context is not None:
+                return self.model_copy(
+                    update={
+                        'GUI_COLUMNS_DATETIME_SHOW_DATE': context.defaults.get('GUI_COLUMNS_DATETIME_SHOW_DATE', False),
+                        'GUI_COLUMNS_DATETIME_SHOW_TIME': context.defaults.get('GUI_COLUMNS_DATETIME_SHOW_TIME', False),
+                        'GUI_COLUMNS_DATETIME_SHOW_ELAPSED_TIME': context.defaults.get('GUI_COLUMNS_DATETIME_SHOW_ELAPSED_TIME', True),
+                    },
+                )
+        return self
+
+    @model_validator(mode='after')
+    def _check_table_sort_columns(self, info: ValidationInfo) -> Self:
+        """Ensure sort columns exist in their respective table's enabled or forced columns."""
+        updates: dict[str, Any] = {}
+        context = self._get_context(info)
+        forced_columns = {'Usernames', 'First Seen', 'Last Rejoin', 'Last Seen', 'Rejoins', 'IP Address'}
+
+        connected_shown = set(self.GUI_COLUMNS_CONNECTED_SHOWN) | forced_columns
+        if self.GUI_CONNECTED_TABLE_SORT_COLUMN not in connected_shown:
+            updates['GUI_CONNECTED_TABLE_SORT_COLUMN'] = 'Last Rejoin'
+            if context is not None:
+                context.ini_rewrites['GUI_CONNECTED_TABLE_SORT_COLUMN'] = 'Last Rejoin'
+            self._set_flag(info, 'should_rewrite', value=True)
+
+        disconnected_shown = set(self.GUI_COLUMNS_DISCONNECTED_SHOWN) | forced_columns
+        if self.GUI_DISCONNECTED_TABLE_SORT_COLUMN not in disconnected_shown:
+            updates['GUI_DISCONNECTED_TABLE_SORT_COLUMN'] = 'Last Seen'
+            if context is not None:
+                context.ini_rewrites['GUI_DISCONNECTED_TABLE_SORT_COLUMN'] = 'Last Seen'
+            self._set_flag(info, 'should_rewrite', value=True)
+
+        if updates:
+            return self.model_copy(update=updates)
+        return self
+
+    # --- Public API ---
+
+    @classmethod
+    def validate_and_get_rewrites(
+        cls,
+        raw_settings: dict[str, str],
+        config: SettingsValidationConfig,
+    ) -> tuple[Self, dict[str, str], dict[str, Any]]:
+        """Validate raw Settings.ini key/value strings and compute a rewrite plan.
+
+        Args:
+            raw_settings: Parsed raw settings mapping from the INI file (UPPER_CASE keys).
+            config: Bundled validation parameters (defaults, column lists, limits, etc.).
+
+        Returns:
+            (validated_model, ini_rewrites, flags)
+        """
+        all_names_set = frozenset(config.all_setting_names)
+        raw_keys = set(raw_settings)
+
+        ini_rewrites: dict[str, str] = {}
+        flags: dict[str, Any] = {}
+
+        # Build full input: defaults first, then overwrite with raw values from INI
+        full_input: dict[str, Any] = dict(config.defaults)
+        full_input.update(raw_settings)
+
+        ctx = _ValidatorContext(
+            defaults=dict(config.defaults),
+            ini_rewrites=ini_rewrites,
+            flags=flags,
+            toggleable_connected_columns=config.toggleable_connected_columns,
+            toggleable_disconnected_columns=config.toggleable_disconnected_columns,
+            all_connected_columns=config.all_connected_columns,
+            all_disconnected_columns=config.all_disconnected_columns,
+            all_third_party_servers=config.all_third_party_servers,
+            max_gui_table_rows_per_page=config.max_gui_table_rows_per_page,
+            min_gui_disconnected_players_timer=config.min_gui_disconnected_players_timer,
+        )
+        parsed = cls.model_validate(full_input, context=ctx)
+
+        # Unknown keys trigger rewrite
+        unknown_keys = raw_keys - all_names_set
+        if unknown_keys:
+            flags['should_rewrite'] = True
+
+        # Missing keys trigger rewrite
+        missing_keys = all_names_set - raw_keys
+        if missing_keys:
+            flags['should_rewrite'] = True
+
+        # Rewrites from validators also trigger
+        if ini_rewrites:
+            flags['should_rewrite'] = True
+
+        return parsed, dict(ini_rewrites), dict(flags)
+
+
+def _normalize_tuple_column(
+    setting_value: str,
+    allowed_columns: tuple[str, ...],
+) -> tuple[tuple[str, ...] | None, bool, bool]:
+    """Normalize a tuple-valued INI setting (e.g. hidden columns, server list).
+
+    Returns:
+        (normalized_tuple, need_rewrite_current, need_rewrite_settings)
+    """
+    try:
+        parsed: object = ast.literal_eval(setting_value)
+    except ValueError, SyntaxError, RecursionError, MemoryError:
+        return None, False, True
+
+    if not isinstance(parsed, tuple):
+        return None, False, True
+
+    if not all(isinstance(item, str) for item in cast('tuple[str | int, ...]', parsed)):
+        return None, False, True
+
+    filtered: list[str] = []
+    need_rewrite_current = False
+    need_rewrite_settings = False
+
+    for value in cast('tuple[str, ...]', parsed):
+        try:
+            case_match, normalized = check_case_insensitive_and_exact_match(value, allowed_columns)
+        except NoMatchFoundError:
+            need_rewrite_settings = True
+            continue
+        filtered.append(normalized)
+        if not case_match:
+            need_rewrite_current = True
+
+    sorted_result = [column for column in allowed_columns if column in filtered]
+    if filtered != sorted_result:
+        need_rewrite_current = True
+
+    return tuple(sorted_result), need_rewrite_current, need_rewrite_settings

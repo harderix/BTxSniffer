@@ -1,0 +1,82 @@
+"""Color palette and semantic color definitions for GUI rendering.
+
+This module provides a modular color system organized into layers:
+1. ColorPalette - Base Nordic-inspired color definitions
+2. StatusBarColors - Semantic colors for status bar HTML formatting
+3. ThresholdColors - Status/health indicator colors for metrics and thresholds
+4. TableColors - Row coloring for connected/disconnected player tables
+"""
+
+import enum
+
+from session_sniffer.constants.standalone import DEFAULT_DETECTED_SERVER_COLOR
+
+
+class ColorPalette(enum.StrEnum):
+    """BTX neon color palette for the entire application.
+
+    Provides a centralized set of primary colors used across all UI components.
+    """
+
+    # Primary accent colors
+    ACCENT_BLUE = '#3ff0ff'  # BTX neon cyan
+    ACCENT_ORANGE = '#ffab2e'  # BTX neon orange
+    ACCENT_PURPLE = '#ff5fe0'  # BTX neon pink
+    ACCENT_GRAY = '#b44dff'  # BTX neon violet
+
+    # Status indicator colors
+    GOOD_GREEN = 'lightgreen'
+    WARNING_YELLOW = 'khaki'
+    CRITICAL_RED = 'indianred'
+
+
+class StatusBarColors(enum.StrEnum):
+    """Color scheme specifically for status bar text rendering.
+
+    Maps semantic meanings (enabled, disabled, divider, etc.) to specific colors
+    from the base palette for use in status bar HTML formatting.
+    """
+
+    # Semantic dividers and separators
+    DIVIDER = ColorPalette.ACCENT_GRAY
+
+    # Status indicators
+    ENABLED = ColorPalette.GOOD_GREEN
+    DISABLED = ColorPalette.CRITICAL_RED
+    DEFAULT_TEXT = ColorPalette.GOOD_GREEN
+
+    # Section labels and accents
+    LABEL_ACCENT = ColorPalette.ACCENT_ORANGE
+    TITLE_ACCENT = ColorPalette.ACCENT_BLUE
+    SECONDARY_ACCENT = ColorPalette.ACCENT_PURPLE
+
+
+class ThresholdColors(enum.StrEnum):
+    """Color scheme for metrics and threshold-based status indication.
+
+    Maps performance thresholds and status conditions to visual indicators
+    used in status displays and performance monitoring.
+    """
+
+    # Threshold status colors
+    CRITICAL = ColorPalette.CRITICAL_RED
+    WARNING = ColorPalette.WARNING_YELLOW
+    HEALTHY = ColorPalette.GOOD_GREEN
+
+
+class TableColors(enum.StrEnum):
+    """Color scheme for player table rows and cell rendering.
+
+    Defines colors for connected and disconnected player rows in the session tables.
+    """
+
+    # Connected player row colors
+    CONNECTED_TEXT = '#39ff88'
+    CONNECTED_USERIP_TEXT = 'white'
+
+    # Disconnected player row colors
+    DISCONNECTED_TEXT = '#ff3860'
+    DISCONNECTED_USERIP_TEXT = 'white'
+
+    # Detected server row colors
+    SERVER_BACKGROUND = DEFAULT_DETECTED_SERVER_COLOR

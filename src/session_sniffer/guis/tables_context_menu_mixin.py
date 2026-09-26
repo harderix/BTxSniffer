@@ -1,0 +1,1041 @@
+"""Context menu mixin for SessionTableView right-click interactions."""
+
+# pylint: disable=too-many-lines
+
+from typing import TYPE_CHECKING, cast
+
+from PySide6.QtCore import QItemSelectionModel, QUrl
+from PySide6.QtGui import QAction, QDesktopServices, QIcon
+from PySide6.QtWidgets import QInputDialog, QMenu, QTableView
+
+from session_sniffer.constants.local import BUILTIN_SCRIPTS_DIR_PATH, RESOURCES_DIR_PATH, USER_SCRIPTS_DIR_PATH
+from session_sniffer.constants.standalone import LOOKY_BASE_HOST
+from session_sniffer.error_messages import ensure_instance
+from session_sniffer.guis.looky_text import (
+    configure_looky_action,
+)
+from session_sniffer.guis.table_model import SessionTableModel
+from session_sniffer.guis.tables_detections_mixin import build_detections_menu, build_detections_menu_multi
+from session_sniffer.guis.tables_player_actions import (
+    block_ip_as_range,
+    copy_player_info_for_discord,
+    copy_players_info_for_discord,
+    create_multi_tcp_ping_menu,
+    create_multi_udp_ping_menu,
+    filter_player_isp,
+    looky_refresh_userip_entries,
+    ping_ip,
+    scan_ports_ip,
+    show_crawler_request,
+    show_detailed_ip_lookup,
+    show_looky_lookup,
+    show_seen_stats,
+    tcp_port_ping,
+    udp_port_ping,
+    web_ping,
+)
+from session_sniffer.guis.tables_userip_mixin import (
+    MIN_USERNAMES_FOR_REMOVAL,
+    resolve_usernames_for_player,
+    userip_add,
+    userip_add_as_range,
+    userip_add_username,
+    userip_convert_to_range,
+    userip_delete,
+    userip_edit_range,
+    userip_move,
+    userip_remove_username,
+    userip_rename,
+    userip_rename_multi,
+)
+from session_sniffer.guis.userip_manager_helpers import populate_userip_databases_menu
+from session_sniffer.networking.ip_range import check_ip_against_ranges
+from session_sniffer.networking.isp_filter import get_player_primary_isp, is_player_isp_filtered
+from session_sniffer.networking.third_party_servers import is_third_party_server_ip
+from session_sniffer.player.registry import PlayersRegistry, SessionHost
+from session_sniffer.player.userip import UserIPDatabases
+from session_sniffer.rendering_core.types import CaptureState
+from session_sniffer.settings.settings import Settings
+from session_sniffer.text_utils import pluralize
+from session_sniffer.utils import dedup_preserve_order, run_cmd_script
+from session_sniffer.guis.btx_notes import PlayerNotes, add_tag_menu, edit_player_note
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
+
+    from PySide6.QtCore import QModelIndex, QPoint
+
+    from session_sniffer.guis.main_window import MainWindow
+    from session_sniffer.models.player import Player
+
+
+def _classify_range_raw(raw: str) -> str:
+    """Return the concrete UserIP range type for a raw entry string.
+
+    Start-end notation (`1.2.3.10-1.2.3.20`) is an `IP range`; CIDR (`/`) and wildcard (`*`)
+    notations are a `subnet`. This mirrors the mode taxonomy used by `IPRangeBuilderDialog`.
+    """
+    if '-' in raw and '/' not in raw and '*' not in raw:
+        return "plage d'IP"
+    return 'subnet'
+
+
+def _classify_userip_entry(ip: str) -> str:
+    """Return the concrete entry label (`single IP`, `subnet`, `IP range`, or `range`) for one IP.
+
+    Exact members of `UserIPDatabases.ips_set` are a `single IP`. Otherwise the covering range
+    entries are classified; a uniform kind yields its specific label, while overlapping kinds of
+    different types fall back to the neutral `range`.
+    """
+    if ip in UserIPDatabases.ips_set:
+        return 'IP unique'
+    labels = {_classify_range_raw(raw) for raw in UserIPDatabases.get_matching_range_raws(ip)}
+    return labels.pop() if len(labels) == 1 else 'range'
+
+
+def _describe_selected_userip_entries(ip_addresses: list[str]) -> str:
+    """Return wording like 'the selected subnet' or 'the 3 selected single IPs' for a UserIP selection.
+
+    Each IP is classified as an exact single-IP entry (a member of `UserIPDatabases.ips_set`) or a
+    range-covered entry, then the phrase is built with the matching noun and correct plurality. When
+    every entry is a range of the same concrete kind the specific noun (`subnet`/`IP range`) is used;
+    a selection mixing single IPs with ranges is described with the neutral noun `entries`.
+    """
+    total_selected_ips = len(ip_addresses)
+
+    single_ip_count = sum(1 for ip_address in ip_addresses if ip_address in UserIPDatabases.ips_set)
+
+    range_ip_count = total_selected_ips - single_ip_count
+
+    if single_ip_count and range_ip_count:
+        noun_label = 'entries'
+
+    elif range_ip_count:
+        entry_types = {_classify_userip_entry(ip_address) for ip_address in ip_addresses}
+
+        noun_label = f'{entry_types.pop()}{pluralize(total_selected_ips)}' if len(entry_types) == 1 else f'range{pluralize(total_selected_ips)}'
+
+    else:
+        noun_label = 'IP unique(s)'
+
+    total_prefix = '' if total_selected_ips == 1 else f'{total_selected_ips} '
+
+    return f'the {total_prefix}selected {noun_label}'
+
+
+class TableContextMenuMixin(QTableView):
+    """Mixin that adds a context menu to SessionTableView."""
+
+    if TYPE_CHECKING:
+        is_connected_table: bool
+        open_rate_graph_callback: Callable[[str], None] | None
+
+        def handle_menu_hovered(self, action: QAction) -> None:
+            """Stub."""
+
+        def copy_selected_cells(self, selected_model: SessionTableModel, selected_indexes: list[QModelIndex]) -> None:
+            """Stub."""
+
+        def remove_players_by_ip_from_table(self, ip_addresses: set[str]) -> None:
+            """Stub."""
+
+        def select_all_cells(self) -> None:
+            """Stub."""
+
+        def unselect_all_cells(self) -> None:
+            """Stub."""
+
+        def select_row_cells(self, row: int) -> None:
+            """Stub."""
+
+        def unselect_row_cells(self, row: int) -> None:
+            """Stub."""
+
+        def select_column_cells(self, column: int) -> None:
+            """Stub."""
+
+        def unselect_column_cells(self, column: int) -> None:
+            """Stub."""
+
+        def _reset_column_sizes(self) -> None:
+            """Stub."""
+
+    def show_context_menu(self, pos: QPoint) -> None:
+        """Show the context menu at the specified position with options to interact with the table's content."""
+
+        def add_action(
+            menu: QMenu,
+            label: str,
+            *,
+            tooltip: str | None = None,
+            handler: Callable[..., None] | None = None,
+            icon: QIcon | None = None,
+        ) -> QAction:
+            """Helper to create and configure a QAction."""
+            action = ensure_instance(menu.addAction(icon, label), QAction) if icon is not None else ensure_instance(menu.addAction(label), QAction)
+
+            if tooltip:
+                action.setToolTip(tooltip)
+            if handler:
+                action.triggered.connect(handler)
+
+            return action
+
+        def add_menu(
+            parent_menu: QMenu,
+            label: str,
+            tooltip: str | None = None,
+            icon: QIcon | None = None,
+        ) -> QMenu:
+            """Helper to create and configure a QMenu."""
+            menu = ensure_instance(parent_menu.addMenu(icon, label), QMenu) if icon is not None else ensure_instance(parent_menu.addMenu(label), QMenu)
+            menu.setToolTipsVisible(True)
+
+            if tooltip:
+                menu.setToolTip(tooltip)
+                menu_action = menu.menuAction()
+                if menu_action:
+                    menu_action.setToolTip(tooltip)
+
+            return menu
+
+        # Determine the index at the clicked position
+        index = self.indexAt(pos)
+        if not index.isValid():
+            return  # Do nothing if the click is outside valid cells
+
+        selected_model = ensure_instance(self.model(), SessionTableModel)
+        selection_model = ensure_instance(self.selectionModel(), QItemSelectionModel)
+        selected_indexes = selection_model.selectedIndexes()
+
+        # Create the main context menu
+        context_menu = QMenu(self)
+        context_menu.setToolTipsVisible(True)
+        context_menu.hovered.connect(self.handle_menu_hovered)
+
+        def get_selected_ips(indexes: list[QModelIndex]) -> list[str]:
+            seen_rows: set[int] = set()
+            ip_addresses: list[str] = []
+            for selected_index in indexes:
+                if selected_index.row() in seen_rows:
+                    continue
+                seen_rows.add(selected_index.row())
+                ip_index = selected_model.index(selected_index.row(), selected_model.ip_column_index)
+                displayed_ip = selected_model.get_display_text(ip_index)
+                if displayed_ip and displayed_ip not in ip_addresses:
+                    ip_addresses.append(displayed_ip)
+            return ip_addresses
+
+        def get_matched_players(ip_addresses: list[str]) -> list[Player]:
+            return [player for ip in ip_addresses if (player := PlayersRegistry.get_player_by_ip(ip)) is not None]
+
+        def remove_blocked_players_from_tables() -> None:
+            main_window = cast('MainWindow', self.window())
+            for player in PlayersRegistry.get_default_sorted_players():
+                if check_ip_against_ranges(player.ip, Settings.blocked_ip_ranges):
+                    if not PlayersRegistry.is_player_connected(player):
+                        main_window.remove_player_from_disconnected(player.ip)
+                    else:
+                        main_window.remove_player_from_connected(player.ip)
+
+        def add_copy_for_discord_action(players: list[Player]) -> None:
+            if not players:
+                return
+
+            if len(selected_indexes) == 1 and len(players) == 1:
+                add_action(
+                    context_menu,
+                    'Copier pour Discord',
+                    tooltip='Copier un rapport détaillé du joueur formaté pour Discord.',
+                    handler=lambda: copy_player_info_for_discord(players[0]),
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')),
+                )
+                return
+
+            add_action(
+                context_menu,
+                'Copier pour Discord',
+                tooltip='Copier les rapports Discord de tous les joueurs sélectionnés.',
+                handler=lambda: copy_players_info_for_discord(players),
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')),
+            )
+
+        def add_remove_players_action(ip_addresses: list[str]) -> None:
+            if not ip_addresses:
+                return
+
+            ips_to_remove = set(ip_addresses)
+            if len(ips_to_remove) == 1:
+                label = 'Retirer le joueur'
+                tooltip = 'Retirer ce joueur du tableau et du registre.'
+            else:
+                label = f'Retirer {len(ips_to_remove)} joueurs'
+                tooltip = f'Retirer les {len(ips_to_remove)} joueurs sélectionnés du tableau et du registre.'
+
+            add_action(
+                context_menu,
+                label,
+                tooltip=tooltip,
+                handler=lambda: self.remove_players_by_ip_from_table(ips_to_remove),
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')),
+            )
+
+        def add_exclude_ips_action(ip_addresses: list[str]) -> None:
+            if not ip_addresses:
+                return
+
+            if len(ip_addresses) == 1:
+
+                def _do_block_single_ip() -> None:
+                    if block_ip_as_range(self, ip_addresses[0]) is None:
+                        return
+                    remove_blocked_players_from_tables()
+
+                add_action(
+                    context_menu,
+                    "Exclure l'IP / la plage",
+                    tooltip='Exclure cette IP ou une plage/sous-réseau de la session. Enregistré dans les paramètres.',
+                    handler=_do_block_single_ip,
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'close.svg')),
+                )
+                return
+
+            def _do_block_multi_ips() -> None:
+                for ip in ip_addresses:
+                    block_ip_as_range(self, ip)
+                if not Settings.blocked_ip_ranges:
+                    return
+                remove_blocked_players_from_tables()
+
+            add_action(
+                context_menu,
+                'Exclure des IP / plages',
+                tooltip="Pour chaque IP sélectionnée, demander s'il faut exclure l'IP seule, une plage ou un sous-réseau. Enregistré dans les paramètres.",
+                handler=_do_block_multi_ips,
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'close.svg')),
+            )
+
+        def remove_isp_filtered_players_from_tables() -> None:
+            main_window = cast('MainWindow', self.window())
+            for player in PlayersRegistry.get_default_sorted_players():
+                if is_player_isp_filtered(player, Settings.capture_filtered_isps):
+                    if not PlayersRegistry.is_player_connected(player):
+                        main_window.remove_player_from_disconnected(player.ip)
+                    else:
+                        main_window.remove_player_from_connected(player.ip)
+
+        def create_filter_isp_handler(target_isp: str) -> Callable[[], None]:
+            def _filter() -> None:
+                if filter_player_isp(self, target_isp) is None:
+                    return
+                remove_isp_filtered_players_from_tables()
+
+            return _filter
+
+        def add_filter_isp_action(players: list[Player]) -> None:
+            if not players:
+                return
+
+            unique_isps: list[str] = dedup_preserve_order([
+                isp_name for player in players if (isp_name := get_player_primary_isp(player)) is not None
+            ])
+            if not unique_isps:
+                return
+
+            if len(unique_isps) == 1:
+                isp_name = unique_isps[0]
+                add_action(
+                    context_menu,
+                    f'Filtrer le FAI \'{isp_name}\'',
+                    tooltip=f'Exclure les joueurs dont le FAI ou l\'ASN correspond à \'{isp_name}\'. Enregistré dans les paramètres.',
+                    handler=create_filter_isp_handler(isp_name),
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'globe.svg')),
+                )
+                return
+
+            filter_isps_menu = add_menu(
+                context_menu,
+                'Filtrer des FAI',
+                tooltip="Exclure les joueurs du FAI ou de l'ASN sélectionné. Enregistré dans les paramètres.",
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'globe.svg')),
+            )
+            for isp_name in unique_isps:
+                add_action(
+                    filter_isps_menu,
+                    f"'{isp_name}'",
+                    tooltip=f'Exclure les joueurs dont le FAI ou l\'ASN correspond à \'{isp_name}\'.',
+                    handler=create_filter_isp_handler(isp_name),
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'globe.svg')),
+                )
+
+        def add_ip_lookup_action(players: list[Player]) -> None:
+            if not players:
+                return
+
+            if len(players) == 1:
+                add_action(
+                    context_menu,
+                    "Détails de l'IP",
+                    tooltip="Afficher une notification avec un rapport détaillé de l'IP du joueur sélectionné.",
+                    handler=lambda: show_detailed_ip_lookup(self, players[0]),
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'search.svg')),
+                )
+                return
+
+            def _show_all_lookups() -> None:
+                for player in players:
+                    show_detailed_ip_lookup(self, player)
+
+            add_action(
+                context_menu,
+                "Détails de l'IP",
+                tooltip="Afficher un rapport détaillé de l'IP de chaque joueur sélectionné.",
+                handler=_show_all_lookups,
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'search.svg')),
+            )
+
+        def add_rate_graph_action(ip_addresses: list[str]) -> None:
+            if not ip_addresses or not self.is_connected_table or self.open_rate_graph_callback is None:
+                return
+
+            open_rate_graph_callback = self.open_rate_graph_callback
+
+            if len(ip_addresses) == 1:
+                add_action(
+                    context_menu,
+                    'Graphique de débit',
+                    tooltip='Ouvrir un graphique PPS/BPS en direct pour ce joueur.',
+                    handler=lambda: open_rate_graph_callback(ip_addresses[0]),
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'chart.svg')),
+                )
+                return
+
+            def _open_multi_graphs() -> None:
+                for ip in ip_addresses:
+                    open_rate_graph_callback(ip)
+
+            add_action(
+                context_menu,
+                'Graphique de débit',
+                tooltip='Ouvrir un graphique PPS/BPS en direct pour chaque joueur sélectionné.',
+                handler=_open_multi_graphs,
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'chart.svg')),
+            )
+
+        def add_seen_stats_action(players: list[Player]) -> None:
+            if not players:
+                return
+
+            if len(players) == 1:
+                add_action(
+                    context_menu,
+                    'Stats de rencontre',
+                    tooltip="Afficher dans combien de sessions cette IP est apparue (aujourd'hui, semaine, mois, année, total).",
+                    handler=lambda: show_seen_stats(self, players[0]),
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'calendar.svg')),
+                )
+                return
+
+            def _show_all_seen_stats() -> None:
+                for player in players:
+                    show_seen_stats(self, player)
+
+            add_action(
+                context_menu,
+                'Stats de rencontre',
+                tooltip="Afficher les stats d'apparition de chaque joueur sélectionné.",
+                handler=_show_all_seen_stats,
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'calendar.svg')),
+            )
+
+        def add_looky_system_menu(parent_menu: QMenu, players: list[Player]) -> None:
+            if not Settings.is_gta5_feature_set() or not players or any(is_third_party_server_ip(player.ip) for player in players):
+                return
+
+            def _apply_looky_gating(
+                action: QAction,
+                *,
+                players: Player | list[Player] | None = None,
+            ) -> None:
+                configure_looky_action(action, default_tooltip=action.toolTip(), players=players)
+
+            looky_menu = add_menu(parent_menu, 'Looky System', 'Outils et raccourcis Looky System.', icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'eye.svg')))
+
+            def _open_looky_website() -> None:
+                QDesktopServices.openUrl(QUrl(LOOKY_BASE_HOST))
+
+            add_action(
+                looky_menu,
+                'Ouvrir le site',
+                tooltip='Ouvrir le site Looky System dans ton navigateur.',
+                handler=_open_looky_website,
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'website.svg')),
+            )
+
+            looky_menu.addSeparator()
+
+            if len(players) == 1:
+                lookup_action = add_action(
+                    looky_menu,
+                    'Rechercher',
+                    tooltip="Interroger l'API Looky System pour trouver les joueurs liés à cette IP.",
+                    handler=lambda: show_looky_lookup(self, players[0]),
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'search.svg')),
+                )
+                _apply_looky_gating(lookup_action, players=players[0])
+                if players[0].looky_system.rockstarids:
+                    crawler_action = add_action(
+                        looky_menu,
+                        'Appeler le crawler',
+                        tooltip='Appeler le bot crawler pour trouver les pseudos des joueurs de la session liée à cette IP.',
+                        handler=lambda: show_crawler_request(self, players[0]),
+                        icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'bot.svg')),
+                    )
+                    _apply_looky_gating(crawler_action, players=players[0])
+                return
+
+            def _show_looky_lookup_for_all() -> None:
+                for player in players:
+                    if Settings.looky_exclusive_gta5_process and CaptureState.is_local_capture() and not player.is_gta5_process:
+                        continue
+                    show_looky_lookup(self, player)
+
+            lookup_all_action = add_action(
+                looky_menu,
+                'Rechercher (toute la sélection)',
+                tooltip="Interroger l'API Looky System pour l'IP de chaque joueur sélectionné.",
+                handler=_show_looky_lookup_for_all,
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'search.svg')),
+            )
+            _apply_looky_gating(lookup_all_action, players=players)
+
+        def add_ping_menu(ip_addresses: list[str]) -> None:
+            if not ip_addresses:
+                return
+
+            ping_menu = add_menu(context_menu, 'Ping', icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')))
+
+            if len(ip_addresses) == 1:
+                add_action(
+                    ping_menu,
+                    'Normal (ICMP)',
+                    tooltip="Vérifie si l'adresse IP sélectionnée répond aux pings.",
+                    handler=lambda: ping_ip(ip_addresses[0]),
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')),
+                )
+                add_action(
+                    ping_menu,
+                    'TCP Port Ping',
+                    tooltip="Vérifie si l'adresse IP sélectionnée répond aux pings TCP sur un port donné.",
+                    handler=lambda: tcp_port_ping(self, ip_addresses[0]),
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')),
+                )
+                add_action(
+                    ping_menu,
+                    'UDP Port Ping',
+                    tooltip="Vérifie si l'adresse IP sélectionnée répond aux pings UDP sur un port donné.",
+                    handler=lambda: udp_port_ping(self, ip_addresses[0]),
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')),
+                )
+                add_action(
+                    ping_menu,
+                    'Web (Check-Host)',
+                    tooltip="Vérifie si l'adresse IP sélectionnée répond via les serveurs de Check-Host.net.",
+                    handler=lambda: web_ping(ip_addresses[0]),
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')),
+                )
+                return
+
+            def _ping_all() -> None:
+                ping_ip(ip_addresses)
+
+            add_action(
+                ping_menu,
+                'Normal (ICMP)',
+                tooltip='Vérifie si les adresses IP sélectionnées répondent aux pings.',
+                handler=_ping_all,
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')),
+            )
+            create_multi_tcp_ping_menu(self, ip_addresses, ping_menu)
+            create_multi_udp_ping_menu(self, ip_addresses, ping_menu)
+            add_action(
+                ping_menu,
+                'Web (Check-Host)',
+                tooltip='Vérifie si les adresses IP sélectionnées répondent via les serveurs de Check-Host.net.',
+                handler=lambda: web_ping(ip_addresses),
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'ping.svg')),
+            )
+
+        def add_scan_ports_action(ip_addresses: list[str]) -> None:
+            if not ip_addresses:
+                return
+            add_action(
+                context_menu,
+                'Scanner les ports…',
+                tooltip='Scanner les ports TCP et UDP des hôtes sélectionnés.',
+                handler=lambda: scan_ports_ip(ip_addresses),
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'port_scanner.svg')),
+            )
+
+        def get_script_candidates(directory: Path) -> list[Path]:
+            allowed_suffixes = {'.bat', '.cmd', '.exe', '.py', '.lnk'}
+            return [script for script in directory.glob('*') if (script.is_file() and not script.name.startswith(('_', '.')) and script.suffix.casefold() in allowed_suffixes)]
+
+        def create_script_handler(script_path: Path, ip_addresses: list[str]) -> Callable[[], None]:
+            return lambda: run_cmd_script(script_path, ip_addresses)
+
+        def create_script_handler_per_ip(script_path: Path, ip_addresses: list[str]) -> Callable[[], None]:
+            def _run() -> None:
+                for ip in ip_addresses:
+                    run_cmd_script(script_path, [ip])
+
+            return _run
+
+        def add_scripts_to_menu(menu: QMenu, scripts: list[Path], ip_addresses: list[str], *, per_ip: bool = False) -> None:
+            factory = create_script_handler_per_ip if per_ip else create_script_handler
+            for script in scripts:
+                add_action(menu, script.resolve().name, tooltip='', handler=factory(script.resolve(), ip_addresses))
+
+        def _populate_scripts_menu(menu: QMenu, builtin_scripts: list[Path], user_scripts: list[Path], ip_addresses: list[str], *, per_ip: bool = False) -> None:
+            add_scripts_to_menu(menu, builtin_scripts, ip_addresses, per_ip=per_ip)
+            if builtin_scripts and user_scripts:
+                menu.addSeparator()
+            add_scripts_to_menu(menu, user_scripts, ip_addresses, per_ip=per_ip)
+
+        def add_user_scripts_menu(ip_addresses: list[str]) -> None:
+            scripts_menu = add_menu(context_menu, 'Scripts perso', icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'code.svg')))
+            builtin_scripts = get_script_candidates(BUILTIN_SCRIPTS_DIR_PATH)
+            user_scripts = get_script_candidates(USER_SCRIPTS_DIR_PATH)
+
+            if len(ip_addresses) == 1:
+                _populate_scripts_menu(scripts_menu, builtin_scripts, user_scripts, ip_addresses)
+                return
+
+            if builtin_scripts or user_scripts:
+                all_at_once_menu = add_menu(
+                    scripts_menu,
+                    'Toutes les IP en arguments',
+                    'Passer toutes les IP sélectionnées en arguments au script en un seul appel.',
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'folder.svg')),
+                )
+                _populate_scripts_menu(all_at_once_menu, builtin_scripts, user_scripts, ip_addresses)
+
+                per_ip_menu = add_menu(
+                    scripts_menu,
+                    'Un processus par IP',
+                    'Lancer un processus de script séparé pour chaque IP sélectionnée.',
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'new_file.svg')),
+                )
+                _populate_scripts_menu(per_ip_menu, builtin_scripts, user_scripts, ip_addresses, per_ip=True)
+
+        def add_detections_menu(players: list[Player]) -> None:
+            if not Settings.is_gta5_feature_set() or not CaptureState.is_local_capture():
+                return
+            if not players:
+                return
+
+            detections_menu = add_menu(context_menu, 'Détections', icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'shield.svg')))
+            if len(players) == 1:
+                build_detections_menu(detections_menu, add_action, players[0], self)
+                return
+            build_detections_menu_multi(detections_menu, add_action, players, self)
+
+        def add_userip_single_menu(ip_address: str, player: Player) -> None:
+            userip_menu = add_menu(context_menu, 'UserIP', icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'database.svg')))
+
+            if player.userip is None:
+                database_paths = UserIPDatabases.get_userip_database_filepaths()
+                player_usernames = resolve_usernames_for_player(player)
+                add_userip_menu = add_menu(userip_menu, 'Add', "Ajouter l'adresse IP sélectionnée à une base UserIP.", icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'add.svg')))
+                populate_userip_databases_menu(
+                    add_userip_menu,
+                    database_paths,
+                    tooltip="Ajouter l'adresse IP sélectionnée à cette base UserIP.",
+                    handler_factory=lambda db_path: lambda: userip_add(self, [ip_address], db_path, usernames=player_usernames),
+                )
+                add_range_userip_menu = add_menu(
+                    userip_menu,
+                    'Ajouter comme plage',
+                    "Ajouter l'IP sélectionnée comme plage dans une base UserIP.",
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'add.svg')),
+                )
+                populate_userip_databases_menu(
+                    add_range_userip_menu,
+                    database_paths,
+                    tooltip="Ajouter l'IP sélectionnée comme plage à cette base UserIP.",
+                    handler_factory=lambda db_path: lambda: userip_add_as_range(self, ip_address, db_path, usernames=player_usernames),
+                )
+                return
+
+            def _open_userip_database() -> None:
+                if player.userip is None:
+                    return
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(player.userip.db_path)))
+
+            add_action(
+                userip_menu,
+                'Ouvrir la base',
+                tooltip="Ouvrir le fichier de la base UserIP de ce joueur dans l'éditeur de texte.",
+                handler=_open_userip_database,
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'folder.svg')),
+            )
+            userip_menu.addSeparator()
+            add_action(
+                userip_menu,
+                'Ajouter un pseudo',
+                tooltip='Ajouter un autre pseudo pour cette adresse IP dans sa base UserIP.',
+                handler=lambda: userip_add_username(self, ip_address, player),
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'add.svg')),
+            )
+            if Settings.is_gta5_feature_set():
+                userip_menu.addSeparator()
+                refresh_action = add_action(
+                    userip_menu,
+                    'Ajouter un pseudo (Looky System)',
+                    tooltip='Chercher cette IP via Looky System et ajouter les nouveaux pseudos à sa base UserIP.',
+                    handler=lambda: looky_refresh_userip_entries(self, [(player.userip.db_path, [ip_address])]) if player.userip else None,
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'eye.svg')),
+                )
+                configure_looky_action(refresh_action, default_tooltip=refresh_action.toolTip(), players=player)
+                userip_menu.addSeparator()
+            entry_desc = _classify_userip_entry(ip_address)
+            if entry_desc == 'single IP':
+                add_action(
+                    userip_menu,
+                    'Convertir en plage',
+                    tooltip=f'Remplacer cette IP par une plage (ex. un VPN ou sous-réseau), en gardant son pseudo{pluralize(len(player.userip.usernames))}.',
+                    handler=lambda: userip_convert_to_range(self, ip_address, player),
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'refresh.svg')),
+                )
+            else:
+                add_action(
+                    userip_menu,
+                    'Modifier la plage',
+                    tooltip=f'Modifier cette entrée {entry_desc}, ou la ramener à une seule IP, en gardant son pseudo{pluralize(len(player.userip.usernames))}.',
+                    handler=lambda: userip_edit_range(self, ip_address, player),
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'edit.svg')),
+                )
+            add_action(
+                userip_menu,
+                'Renommer',
+                tooltip='Renommer toutes les entrées de cette IP en choisissant parmi les pseudos de sa base.',
+                handler=lambda: userip_rename(self, ip_address, player),
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'edit.svg')),
+            )
+            move_userip_menu = add_menu(
+                userip_menu,
+                'Déplacer',
+                f'Déplacer cette entrée {entry_desc} vers une autre base UserIP.',
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'move_box.svg')),
+            )
+            populate_userip_databases_menu(
+                move_userip_menu,
+                UserIPDatabases.get_userip_database_filepaths(),
+                tooltip=f'Déplacer cette entrée {entry_desc} vers cette base UserIP.',
+                handler_factory=lambda db_path: lambda: userip_move(self, [ip_address], db_path),
+                disabled_path=player.userip.db_path,
+            )
+            if player.userip.usernames and len(player.userip.usernames) >= MIN_USERNAMES_FOR_REMOVAL:
+                add_action(
+                    userip_menu,
+                    'Supprimer un pseudo',
+                    tooltip='Supprimer les pseudos sélectionnés de cette IP en gardant les autres.',
+                    handler=lambda: userip_remove_username(self, ip_address, player),
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')),
+                )
+            add_action(
+                userip_menu,
+                'Supprimer',
+                tooltip=f'Supprimer cette entrée {entry_desc} de sa base UserIP.',
+                handler=lambda: userip_delete(self, [ip_address]),
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')),
+            )
+
+        def add_userip_multi_menu(ip_addresses: list[str], players: list[Player]) -> None:
+            if all(not UserIPDatabases.is_known_ip(ip) for ip in ip_addresses):
+                userip_menu = add_menu(context_menu, 'UserIP', icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'database.svg')))
+                add_count = '' if len(ip_addresses) == 1 else f'{len(ip_addresses)} '
+                add_userip_menu = add_menu(userip_menu, 'Ajouter la sélection', icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'add.svg')))
+                all_usernames = dedup_preserve_order(
+                    *(
+                        ([player.ps3_username] if player.ps3_username else [])
+                        + (list(player.userip.usernames) if player.userip else [])
+                        + (player.mod_menus.usernames if player.mod_menus else [])
+                        + (player.looky_system.usernames if player.looky_system.is_initialized else [])
+                        + player.usernames
+                        for player in players
+                    )
+                )
+                populate_userip_databases_menu(
+                    add_userip_menu,
+                    UserIPDatabases.get_userip_database_filepaths(),
+                    tooltip=f'Ajouter {add_count}l\'adresse IP sélectionnée{pluralize(len(ip_addresses), plural="es")} à cette base UserIP.',
+                    handler_factory=lambda db_path: lambda: userip_add(self, ip_addresses, db_path, usernames=all_usernames),
+                )
+                return
+
+            if all(UserIPDatabases.is_known_ip(ip) for ip in ip_addresses):
+                userip_menu = add_menu(context_menu, 'UserIP', icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'database.svg')))
+                entries_phrase = _describe_selected_userip_entries(ip_addresses)
+
+                rename_players = [player for player in players if player.userip is not None]
+                if rename_players:
+                    rename_phrase = _describe_selected_userip_entries([player.ip for player in rename_players])
+                    add_action(
+                        userip_menu,
+                        'Renommer la sélection',
+                        tooltip=f'Renommer le pseudo de {rename_phrase} dans sa base UserIP.',
+                        handler=lambda: userip_rename_multi(self, rename_players),
+                        icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'edit.svg')),
+                    )
+
+                if Settings.is_gta5_feature_set():
+                    # Group IPs by their UserIP database path for the batch refresh
+                    _refresh_by_db: dict[Path, list[str]] = {}
+                    for _p in players:
+                        if _p.userip is not None:
+                            if Settings.looky_exclusive_gta5_process and CaptureState.is_local_capture() and not _p.is_gta5_process:
+                                continue
+                            _refresh_by_db.setdefault(_p.userip.db_path, []).append(_p.ip)
+                    if _refresh_by_db:
+                        if rename_players:
+                            userip_menu.addSeparator()
+                        refresh_multi_action = add_action(
+                            userip_menu,
+                            'Ajouter des pseudos (Looky System)',
+                            tooltip=f'Chercher {entries_phrase} via Looky System et ajouter les nouveaux pseudos à leurs bases UserIP.',
+                            handler=lambda: looky_refresh_userip_entries(self, list(_refresh_by_db.items())),
+                            icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'eye.svg')),
+                        )
+                        configure_looky_action(refresh_multi_action, default_tooltip=refresh_multi_action.toolTip(), players=players)
+                        userip_menu.addSeparator()
+
+                move_userip_menu = add_menu(
+                    userip_menu,
+                    'Déplacer la sélection',
+                    f'Déplacer {entries_phrase} vers une autre base UserIP.',
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'move_box.svg')),
+                )
+                populate_userip_databases_menu(
+                    move_userip_menu,
+                    UserIPDatabases.get_userip_database_filepaths(),
+                    tooltip=f'Déplacer {entries_phrase} vers cette base UserIP.',
+                    handler_factory=lambda db_path: lambda: userip_move(self, ip_addresses, db_path),
+                )
+
+                add_action(
+                    userip_menu,
+                    'Supprimer la sélection',
+                    tooltip=f'Supprimer {entries_phrase} des bases UserIP.',
+                    handler=lambda: userip_delete(self, ip_addresses),
+                    icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')),
+                )
+
+        selected_ips = get_selected_ips(selected_indexes)
+        selected_players = get_matched_players(selected_ips)
+        selected_cell_count = len(selected_indexes)
+
+        def add_search_in_menu() -> None:
+            cell_text = selected_model.get_display_text(index)
+            if not cell_text:
+                return
+
+            def _resolve_search_text() -> str | None:
+                if index.column() != selected_model.username_column_index:
+                    return cell_text
+
+                # When the cell belongs to the Usernames column, offer the exact structured usernames
+                # from the matched player (UserIP, Looky System, PS3, etc.) without string splitting.
+                row_ip_index = selected_model.index(index.row(), selected_model.ip_column_index)
+                row_ip = selected_model.get_display_text(row_ip_index)
+                player = PlayersRegistry.get_player_by_ip(row_ip) if row_ip else None
+
+                usernames: list[str] = resolve_usernames_for_player(player) if player else []
+
+                if not usernames:
+                    usernames = [cell_text]
+
+                if len(usernames) == 1:
+                    chosen_username, success = QInputDialog.getText(
+                        self,
+                        'Search Username',
+                        'Enter the username to search for:',
+                        text=usernames[0],
+                    )
+                    if not success or not chosen_username.strip():
+                        return None
+                    return chosen_username.strip()
+
+                chosen_username, success = QInputDialog.getItem(
+                    self,
+                    'Search Username',
+                    'Select or enter the username to search for:',
+                    usernames,
+                    0,
+                    editable=True,
+                )
+                if not success or not chosen_username.strip():
+                    return None
+                return chosen_username.strip()
+
+            main_window = cast('MainWindow', self.window())
+
+            def _search_userip_all_databases() -> None:
+                search_query = _resolve_search_text()
+                if search_query:
+                    main_window.open_userip_manager_and_search(search_query)
+
+            def _search_userip_logging() -> None:
+                search_query = _resolve_search_text()
+                if search_query:
+                    main_window.open_logs_manager_and_search_userip(search_query)
+
+            def _search_sessions_logging() -> None:
+                search_query = _resolve_search_text()
+                if search_query:
+                    main_window.open_logs_manager_and_search_sessions(search_query)
+
+            search_menu = add_menu(
+                context_menu,
+                'Rechercher dans…',
+                'Chercher le texte de cette cellule dans les logs et la base UserIP.',
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'search.svg')),
+            )
+            add_action(
+                search_menu,
+                'Toutes les bases UserIP',
+                tooltip='Ouvrir le gestionnaire UserIP avec une recherche de ce texte dans toutes les bases.',
+                handler=_search_userip_all_databases,
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'database.svg')),
+            )
+            add_action(
+                search_menu,
+                'Log UserIP',
+                tooltip="Ouvrir le gestionnaire de logs sur l'onglet Log UserIP et filtrer avec ce texte.",
+                handler=_search_userip_logging,
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'text_editor.svg')),
+            )
+            add_action(
+                search_menu,
+                'Logs de sessions',
+                tooltip="Ouvrir le gestionnaire de logs sur l'onglet Logs de sessions et chercher ce texte dans tous les fichiers.",
+                handler=_search_sessions_logging,
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'folder.svg')),
+            )
+
+        def add_shared_selected_players_actions(ip_addresses: list[str], players: list[Player]) -> None:
+            add_exclude_ips_action(ip_addresses)
+            add_filter_isp_action(players)
+            add_ip_lookup_action(players)
+            add_rate_graph_action(ip_addresses)
+            add_seen_stats_action(players)
+            context_menu.addSeparator()
+            add_looky_system_menu(context_menu, players)
+            add_ping_menu(ip_addresses)
+            add_scan_ports_action(ip_addresses)
+            add_detections_menu(players)
+            add_user_scripts_menu(ip_addresses)
+
+        def add_clear_session_host_action(ip_address: str) -> None:
+            if not Settings.is_session_host_feature_set() or not SessionHost.is_host(ip_address):
+                return
+
+            add_action(
+                context_menu,
+                "Effacer l'hôte de session",
+                tooltip='Retirer à la main ce joueur comme hôte de session détecté.',
+                handler=SessionHost.clear_session_host_data,
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'close.svg')),
+            )
+
+        copy_selection_action = add_action(
+            context_menu,
+            'Copier la sélection',
+            tooltip='Copier les cellules sélectionnées.',
+            handler=lambda: self.copy_selected_cells(selected_model, selected_indexes),
+            icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')),
+        )
+        copy_selection_action.setShortcut('Ctrl+C')
+        add_copy_for_discord_action(selected_players)
+        if len(selected_players) == 1:
+            noted_player = selected_players[0]
+            has_note = bool(PlayerNotes.get(noted_player.ip))
+            add_action(
+                context_menu,
+                'Modifier la note…' if has_note else 'Ajouter une note…',
+                tooltip='Écrire une note perso sur ce joueur (gardée entre les sessions, visible au survol, dans l\'historique et la mini-fenêtre).',
+                handler=lambda: edit_player_note(self, noted_player.ip, list(noted_player.usernames)),
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'edit.svg')),
+            )
+            add_tag_menu(context_menu, noted_player.ip, list(noted_player.usernames), self.viewport().update)
+        context_menu.addSeparator()
+
+        select_menu = add_menu(context_menu, 'Sélectionner', icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'select_all.svg')))
+        select_all_action = add_action(
+            select_menu,
+            'Tout sélectionner',
+            tooltip='Sélectionner toutes les cellules du tableau.',
+            handler=self.select_all_cells,
+            icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'select_all.svg')),
+        )
+        select_all_action.setShortcut('Ctrl+A')
+        add_action(
+            select_menu,
+            'Sélectionner la ligne',
+            tooltip='Sélectionner toutes les cellules de cette ligne.',
+            handler=lambda: self.select_row_cells(index.row()),
+            icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'menu_arrow_right.svg')),
+        )
+        add_action(
+            select_menu,
+            'Sélectionner la colonne',
+            tooltip='Sélectionner toutes les cellules de cette colonne.',
+            handler=lambda: self.select_column_cells(index.column()),
+            icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'menu_arrow_down.svg')),
+        )
+
+        unselect_menu = add_menu(context_menu, 'Désélectionner', icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'unselect_all.svg')))
+        add_action(
+            unselect_menu,
+            'Tout désélectionner',
+            tooltip='Désélectionner toutes les cellules du tableau.',
+            handler=self.unselect_all_cells,
+            icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'unselect_all.svg')),
+        )
+        add_action(
+            unselect_menu,
+            'Désélectionner la ligne',
+            tooltip='Désélectionner toutes les cellules de cette ligne.',
+            handler=lambda: self.unselect_row_cells(index.row()),
+            icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'menu_arrow_right.svg')),
+        )
+        add_action(
+            unselect_menu,
+            'Désélectionner la colonne',
+            tooltip='Désélectionner toutes les cellules de cette colonne.',
+            handler=lambda: self.unselect_column_cells(index.column()),
+            icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'menu_arrow_down.svg')),
+        )
+        context_menu.addSeparator()
+
+        add_remove_players_action(selected_ips)
+        context_menu.addSeparator()
+
+        is_single_player_selection = selected_cell_count == 1 and len(selected_ips) == 1 and len(selected_players) == 1
+        is_multi_selection_with_ips = selected_cell_count > 1 and bool(selected_ips)
+
+        if is_single_player_selection:
+            add_clear_session_host_action(selected_ips[0])
+
+        if is_single_player_selection or is_multi_selection_with_ips:
+            add_shared_selected_players_actions(selected_ips, selected_players)
+
+        if is_single_player_selection:
+            add_userip_single_menu(selected_ips[0], selected_players[0])
+        elif is_multi_selection_with_ips:
+            add_userip_multi_menu(selected_ips, selected_players)
+
+        add_search_in_menu()
+
+        context_menu.popup(self.mapToGlobal(pos))

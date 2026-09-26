@@ -1,0 +1,34 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Session Sniffer",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "session_sniffer",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": true,
+            "stopOnEntry": false,
+            "subProcess": true,
+            "windows": {
+                "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+                "env": {
+                    "PYTHONPATH": "${workspaceFolder};${workspaceFolder}/src"
+                }
+            },
+            "linux": {
+                "python": "${workspaceFolder}/.venv/bin/python",
+                "env": {
+                    "PYTHONPATH": "${workspaceFolder}:${workspaceFolder}/src"
+                }
+            },
+            "osx": {
+                "python": "${workspaceFolder}/.venv/bin/python",
+                "env": {
+                    "PYTHONPATH": "${workspaceFolder}:${workspaceFolder}/src"
+                }
+            }
+        }
+    ]
+}

@@ -1,0 +1,72 @@
+name: Build BTXSniffer release
+
+# Quand tu publies une "Release" sur GitHub (ex. tag v1.6.0), ce workflow compile
+# BTXSniffer.exe sur un PC Windows de GitHub et l'ajoute automatiquement à la release.
+# Les BTXSniffer déjà installés verront alors la mise à jour (menu Aide → Vérifier les mises à jour,
+# ou au démarrage).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    name: Build BTXSniffer.exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          architecture: x64
+
+      - name: Install BTXSniffer and PyInstaller
+        working-directory: .github/workflows
+        run: |
+          python -m venv .venv
+          .venv/Scripts/python -m pip install --upgrade pip
+          .venv/Scripts/python -m pip install ../..
+          .venv/Scripts/python -m pip install pyinstaller
+
+      - name: Bake build metadata (version = release tag)
+        if: github.event_name == 'release'
+        working-directory: .github/workflows
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_DATE: ${{ github.event.release.published_at }}
+        run: .venv/Scripts/python scripts/bake_build_metadata.py
+
+      - name: Build BTXSniffer.exe
+        working-directory: .github/workflows
+        run: .venv/Scripts/python -m PyInstaller --noconfirm --clean Session_Sniffer.spec
+
+      - name: Check the exe exists
+        working-directory: .github/workflows
+        run: test -f dist/BTXSniffer.exe
+
+      - name: Keep the exe as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BTXSniffer.exe
+          path: .github/workflows/dist/BTXSniffer.exe
+          if-no-files-found: error
+
+      - name: Attach BTXSniffer.exe to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" ".github/workflows/dist/BTXSniffer.exe" --repo "${{ github.repository }}" --clobber

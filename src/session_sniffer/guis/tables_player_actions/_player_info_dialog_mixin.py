@@ -1,0 +1,110 @@
+"""Shared base mixin for player-info dialogs (group boxes, form rows, layout helpers)."""
+
+from typing import override
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QCloseEvent, QFont
+from PySide6.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QGroupBox,
+    QLabel,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
+
+from session_sniffer.guis.stylesheets import (
+    PLAYER_INFO_FORM_LABEL_STYLESHEET,
+    PLAYER_INFO_VALUE_LABEL_STYLESHEET,
+    player_info_group_stylesheet,
+    player_info_header_stylesheet,
+)
+from session_sniffer.guis.utils import apply_adaptive_window_size
+from session_sniffer.guis.i18n import tr
+
+
+class PlayerInfoDialogMixin(QDialog):
+    """Base class providing shared layout helpers for player-info dialogs.
+
+    Concrete subclasses call `_apply_standard_dialog_size`, `_add_header_label`,
+    `_init_scroll_area`, and `_add_close_button_box` from their `__init__`, and use
+    `_make_group` / `_add_row` when building content sections.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """Initialize the dialog with the top-level parent window."""
+        super().__init__(parent.window() if parent is not None else None)
+
+    @staticmethod
+    def _make_group(title: str, *, accent: str) -> tuple[QGroupBox, QFormLayout]:
+        """Create a styled group box with an attached QFormLayout and return both."""
+        group = QGroupBox(title)
+        group.setStyleSheet(player_info_group_stylesheet(accent))
+        form = QFormLayout(group)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(5)
+        form.setContentsMargins(10, 8, 10, 10)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        return group, form
+
+    @staticmethod
+    def _add_row(form: QFormLayout, label_text: str, value: str) -> None:
+        """Append a copyable label/value row to *form*."""
+        label_widget = QLabel(f'{tr(label_text)} :')
+        label_widget.setStyleSheet(PLAYER_INFO_FORM_LABEL_STYLESHEET)
+        form.addRow(label_widget, PlayerInfoDialogMixin._make_value_label(value))
+
+    @staticmethod
+    def _make_value_label(text: str = '') -> QLabel:
+        """Create and style a copyable value `QLabel`."""
+        value_widget = QLabel(text)
+        value_widget.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        value_widget.setCursor(Qt.CursorShape.IBeamCursor)
+        value_widget.setWordWrap(True)
+        value_widget.setFont(QFont('Consolas'))
+        value_widget.setStyleSheet(PLAYER_INFO_VALUE_LABEL_STYLESHEET)
+        value_widget.setToolTip('Clique et glisse pour sélectionner ; Ctrl+C pour copier.')
+        return value_widget
+
+    def _init_scroll_area(self, outer_layout: QVBoxLayout) -> QVBoxLayout:
+        """Add a frameless scroll area to *outer_layout* and return its inner `QVBoxLayout`."""
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        outer_layout.addWidget(scroll, stretch=1)
+
+        scroll_content = QWidget()
+        scroll.setWidget(scroll_content)
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(2, 2, 2, 2)
+        scroll_layout.setSpacing(10)
+        return scroll_layout
+
+    def _add_close_button_box(self, outer_layout: QVBoxLayout) -> None:
+        """Append a Close button box to *outer_layout*."""
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
+        button_box.rejected.connect(self.reject)
+        button_box.accepted.connect(self.accept)
+        outer_layout.addWidget(button_box)
+
+    def _apply_standard_dialog_size(self) -> None:
+        """Apply a scaled minimum size and an adaptive resize based on the available screen resolution."""
+        apply_adaptive_window_size(self, min_size=(560, 420), size_1080p=(700, 560), size_720p=(620, 500))
+
+    def _add_header_label(self, outer_layout: QVBoxLayout, text: str, grad_stop0: str, grad_stop1: str) -> QLabel:
+        """Create a gradient header label, add it to *outer_layout*, and return it."""
+        header = QLabel(text)
+        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        header.setStyleSheet(player_info_header_stylesheet(grad_stop0, grad_stop1))
+        header.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        outer_layout.addWidget(header)
+        return header
+
+    @override
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Handle the close event."""
+        super().closeEvent(event)

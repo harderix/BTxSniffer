@@ -1,0 +1,233 @@
+[build-system]
+requires = ["setuptools>=69.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "session_sniffer"
+version = "v1.5.0rc.63+20260926.1443"
+dependencies = [
+    "aiohttp==3.14.3",
+    "geoip2==5.3.0",
+    "packaging==26.3",
+    "pydantic==2.13.5",
+    "PySide6==6.11.2",
+    "requests==2.34.2",
+
+    # Security fixes
+    "certifi>=2024.7.4",
+    "idna>=3.7",
+]
+requires-python = ">=3.14,<3.15"
+authors = [{ name = "BUZZARDGTA" }]
+description = "A packet sniffer (also known as an IP sniffer/puller) specifically designed for Peer-To-Peer (P2P) video games on PC and consoles (PlayStation and Xbox)."
+license = { file = "COPYING" }
+readme = "README.md"
+
+[project.urls]
+Documentation = "https://github.com/BUZZARDGTA/Session-Sniffer/wiki"
+Repository = "https://github.com/BUZZARDGTA/Session-Sniffer"
+Issues = "https://github.com/BUZZARDGTA/Session-Sniffer/issues"
+Discord = "https://discord.gg/hMZ7MsPX7G"
+
+[tool.uv]
+managed = true
+python-preference = "managed"
+
+[project.optional-dependencies]
+dev = [
+    "flake8",
+    "mypy",
+    "pip-audit",
+    "pylint",
+    "pyrefly",
+    "pyright",
+    "ruff",
+    "ty",
+    "types-requests==2.33.0.20260906",
+    "vulture",
+]
+
+
+[tool.mypy]
+python_version = "3.14"
+platform = "win32"
+check_untyped_defs = true
+ignore_missing_imports = true
+strict = true
+
+
+[[tool.mypy.overrides]]
+module = "session_sniffer.error_messages"
+warn_unused_ignores = false
+
+
+[tool.pylint.master]
+enable = "all"
+extension-pkg-allow-list = ["PySide6", "shiboken6"]
+generated-members = [
+    "connect",
+    "disconnect",
+    "emit",
+    "setBrush",
+    "setColor",
+] # Signal and PySide6 methods not introspectable by pylint
+ignore = [".history", ".venv"]
+ignore-patterns = "^\\.#|.*\\.pyi"
+py-version = "3.14"
+recursive = true
+
+[tool.pylint.format]
+max-line-length = 176
+
+[tool.pylint."messages control"]
+disable = [
+    "consider-using-with",
+    "global-statement",
+    "locally-disabled",
+    "redefined-outer-name",
+    "suppressed-message",
+    "too-many-branches",
+    "too-many-instance-attributes",
+    "too-many-locals",
+    "too-many-statements",
+]
+
+[tool.pylint.basic]
+const-rgx = "(^[A-Z_][A-Z0-9_]*$|^_atexit_registered$)"
+good-names = [
+    "_atexit_registered",
+    "_MIB_UDPROW_OWNER_PID",
+    "_OPER_STATUS_FLAGS",
+    "dwSize",
+    "InterfaceIndex",
+    "IP_ADAPTER_ADDRESSES",
+    "IP_ADAPTER_GATEWAY_ADDRESS",
+    "IP_ADAPTER_UNICAST_ADDRESS",
+    "MIB_IF_ROW2",
+    "MIB_IPNETROW",
+    "SOCKADDR_IN",
+    "SOCKET_ADDRESS",
+]
+method-rgx = "^(__[a-z][a-z0-9_]*__|_?[a-z][a-z0-9_]*|closeEvent|columnCount|eventFilter|filterAcceptsRow|headerData|helpEvent|highlightBlock|horizontalHeader|keyPressEvent|lessThan|mouseMoveEvent|mousePressEvent|mouseReleaseEvent|paintEvent|resizeEvent|rowCount|selectionModel|setModel|showEvent|sizeHint|verticalHeader)$"
+
+[tool.pylint.design]
+exclude-too-few-public-methods = [".*Structure.*"]
+
+[tool.pylint.variables]
+allowed-redefined-builtins = ["object"]
+
+
+[tool.pyright]
+pythonVersion = "3.14"
+pythonPlatform = "Windows"
+typeCheckingMode = "strict"
+reportIncompatibleMethodOverride = "none"
+reportUnknownMemberType = "none"
+extraPaths = ["src"]
+venvPath = "."
+venv = ".venv"
+
+
+[tool.ruff]
+target-version = "py314"
+line-length = 176
+exclude = [".history", ".venv"]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.ruff.lint]
+ignore = [
+    "C901",    # complex-structure
+    "COM812",  # missing-trailing-comma - conflict with Ruff formatter (trailing comma handled by formatter)
+    "CPY",     # missing-copyright-notice
+    "ERA001",  # commented-out-code
+    "FIX002",  # line-contains-todo
+    "PLR0912", # too-many-branches
+    "PLR0915", # too-many-statements
+    "S603",    # subprocess-without-shell-equals-true
+    "S606",    # start-process-with-no-shell
+    "TD003",   # missing-todo-link
+    "TD005",   # missing-todo-description
+]
+select = ["ALL"]
+
+[tool.ruff.lint.per-file-ignores]
+".dev/*" = ["INP001"]
+"check_project_dependencies.py" = ["INP001", "T201"]
+"code_quality_checks.py" = ["INP001", "T201", "S602"]
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "single"
+
+[tool.ruff.lint.isort]
+known-first-party = ["session_sniffer"]
+section-order = [
+    "future",
+    "standard-library",
+    "third-party",
+    "first-party",
+    "local-folder",
+]
+
+[tool.ruff.lint.pep8-naming]
+ignore-names = [
+    "_MIB_UDPROW_OWNER_PID",
+    "_OPER_STATUS_FLAGS",
+    "IP_ADAPTER_ADDRESSES",
+    "IP_ADAPTER_GATEWAY_ADDRESS",
+    "IP_ADAPTER_UNICAST_ADDRESS",
+    "MIB_IF_ROW2",
+    "MIB_IPNETROW",
+    "SOCKADDR_IN",
+    "SOCKET_ADDRESS",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.flake8-type-checking]
+runtime-evaluated-base-classes = ["pydantic.BaseModel", "typing.NamedTuple"]
+
+
+[tool.pyrefly]
+python_version = "3.14"
+python-platform = "win32"
+min-severity = "warn"
+site-package-path = [
+    ".venv/Lib/site-packages",
+    ".venv/lib/python3.14/site-packages",
+]
+
+[tool.pyrefly.errors]
+bad-assignment = "ignore"
+missing-attribute = "ignore"
+unsupported-operation = "ignore"
+
+
+[tool.ty.environment]
+python-platform = "win32"
+python-version = "3.14"
+
+[tool.ty.src]
+exclude = [".history"]
+
+[tool.ty.rules]
+all = "error"
+
+[tool.ty.terminal]
+error-on-warning = true # Error if ty emits any warning-level diagnostics.
+
+
+[tool.vulture]
+exclude = [".history", ".venv"]
+min_confidence = 61
+ignore_names = [
+    "QFont",
+    "QRect",
+    "filterAcceptsRow",
+    "flush",
+    "highlightBlock",
+    "snapshot_version",
+    "thread_name",
+]

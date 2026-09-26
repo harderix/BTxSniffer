@@ -1,0 +1,255 @@
+"""DetectionNotificationDialog, PlayerDetectionDialog, and related helpers."""
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QLabel,
+    QVBoxLayout,
+    QWidget,
+)
+
+from session_sniffer.constants.standalone import TITLE
+from session_sniffer.guis.stylesheets import DETECTION_WARN_LABEL_STYLESHEET
+from session_sniffer.guis.tables_player_actions._format import format_bool, format_text
+from session_sniffer.guis.tables_player_actions._player_info_dialog_mixin import PlayerInfoDialogMixin
+from session_sniffer.guis.utils import ActiveDialogRegistry, format_player_display, set_dialog_window_flags
+from session_sniffer.text_utils import pluralize
+
+if TYPE_CHECKING:
+    from session_sniffer.models.player import Player
+
+NotificationType = Literal[
+    'player_joined_session',
+    'player_rejoined_session',
+    'player_left_session',
+]
+
+
+@dataclass(slots=True, kw_only=True)
+class DetectionNotificationInfo:
+    """Bundled metadata for a detection manager notification dialog."""
+
+    display_title: str
+    extra_detection_fields: list[tuple[str, str]]
+    event_time: str
+
+
+class DetectionNotificationDialog(PlayerInfoDialogMixin):
+    """A non-modal dialog showing a detection manager notification for a player."""
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        player: Player,
+        info: DetectionNotificationInfo,
+    ) -> None:
+        """Snapshot player data at detection time and build the dialog UI."""
+        super().__init__(parent)
+        set_dialog_window_flags(self, keep_on_top=True)
+
+        self.setWindowTitle(f'{TITLE} - {info.display_title} ({format_player_display(player.ip, player.usernames)})')
+        self._apply_standard_dialog_size()
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(10, 10, 10, 10)
+        outer_layout.setSpacing(8)
+
+        self._add_header_label(outer_layout, f'{info.display_title} — {format_player_display(player.ip, player.usernames)}', '#744210', '#975a16')
+
+        scroll_layout = self._init_scroll_area(outer_layout)
+
+        self._build_detection_group(scroll_layout, player, info.extra_detection_fields, info.event_time)
+        self._build_connection_group(scroll_layout, player)
+        self._build_location_group(scroll_layout, player)
+        self._build_network_group(scroll_layout, player)
+        self._build_flags_group(scroll_layout, player)
+        scroll_layout.addStretch(1)
+
+        self._add_close_button_box(outer_layout)
+
+    def _build_detection_group(self, parent_layout: QVBoxLayout, player: Player, extra_detection_fields: list[tuple[str, str]], event_time: str) -> None:
+        """Add the 'Detection Details' section."""
+        group, form = self._make_group('Détails de la détection', accent='#c53030')
+        self._add_row(form, 'Time', event_time)
+        for label, value in extra_detection_fields:
+            self._add_row(form, label, value)
+        self._add_row(form, f'Pseudo{pluralize(len(player.usernames))}', ', '.join(player.usernames) or 'N/A')
+        parent_layout.addWidget(group)
+
+    def _build_connection_group(self, parent_layout: QVBoxLayout, player: Player) -> None:
+        """Add the 'Connection Details' section."""
+        group, form = self._make_group('Détails de la connexion', accent='#cb1099')
+        self._add_row(form, 'IP Address', player.ip)
+        self._add_row(form, 'Hostname', format_text(player.reverse_dns.hostname))
+        parent_layout.addWidget(group)
+
+    def _build_location_group(self, parent_layout: QVBoxLayout, player: Player) -> None:
+        """Add the 'Location Details' section."""
+        group, form = self._make_group('Localisation', accent='#38a169')
+        self._add_row(form, 'Country', format_text(player.iplookup.geolite2.country))
+        self._add_row(form, 'City', format_text(player.iplookup.geolite2.city))
+        parent_layout.addWidget(group)
+
+    def _build_network_group(self, parent_layout: QVBoxLayout, player: Player) -> None:
+        """Add the 'Network Details' section."""
+        group, form = self._make_group('Réseau', accent='#d69e2e')
+        self._add_row(form, 'ISP', format_text(player.iplookup.ipapi.isp))
+        self._add_row(form, 'Organisation', format_text(player.iplookup.ipapi.org))
+        asn = format_text(player.iplookup.ipapi.asn)
+        as_name = format_text(player.iplookup.ipapi.as_name)
+        asn_display = f'{asn} ({as_name})' if asn != 'N/A' and as_name != 'N/A' else asn
+        self._add_row(form, 'ASN', asn_display)
+        parent_layout.addWidget(group)
+
+    def _build_flags_group(self, parent_layout: QVBoxLayout, player: Player) -> None:
+        """Add the 'Detection Flags' section."""
+        group, form = self._make_group('Indicateurs', accent='#7e54db')
+        self._add_row(form, 'Mobile (cellulaire)', format_bool(player.iplookup.ipapi.mobile))
+        self._add_row(form, 'Proxy / VPN / Tor', format_bool(player.iplookup.ipapi.proxy))
+        self._add_row(form, 'Hébergeur / Datacenter', format_bool(player.iplookup.ipapi.hosting))
+        parent_layout.addWidget(group)
+
+
+_active_notification_dialogs: ActiveDialogRegistry[tuple[str, str], DetectionNotificationDialog] = ActiveDialogRegistry()
+
+
+def show_detection_notification_dialog(
+    parent: QWidget | None,
+    player: Player,
+    info: DetectionNotificationInfo,
+) -> None:
+    """Open or focus the Detection Notification dialog for *player*."""
+    _active_notification_dialogs.show_or_focus((player.ip, info.display_title), lambda: DetectionNotificationDialog(parent, player, info))
+
+
+@dataclass(slots=True, kw_only=True)
+class PlayerDetectionInfo:
+    """Bundled metadata for a player detection event notification."""
+
+    event_type: NotificationType
+    title: str
+    description: str
+    event_time: str
+    data_ready: bool
+
+
+_DETECTION_TYPE_HEADER_COLORS: dict[NotificationType, tuple[str, str]] = {
+    'player_joined_session': ('#276749', '#38a169'),
+    'player_rejoined_session': ('#cb1099', '#ed1eb6'),
+    'player_left_session': ('#9b2c2c', '#c53030'),
+}
+_DETECTION_DEFAULT_HEADER_COLORS = ('#40264f', '#614171')
+
+
+class PlayerDetectionDialog(PlayerInfoDialogMixin):
+    """A non-modal dialog showing a snapshot of player detection event data."""
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        player: Player,
+        info: PlayerDetectionInfo,
+    ) -> None:
+        """Snapshot player data at event time and build the dialog UI."""
+        super().__init__(parent)
+        set_dialog_window_flags(self, keep_on_top=True)
+
+        self.setWindowTitle(f'{TITLE} - {info.title} ({format_player_display(player.ip, player.usernames)})')
+        self._apply_standard_dialog_size()
+
+        color_start, color_stop = _DETECTION_TYPE_HEADER_COLORS.get(info.event_type, _DETECTION_DEFAULT_HEADER_COLORS)
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(10, 10, 10, 10)
+        outer_layout.setSpacing(8)
+
+        self._add_header_label(outer_layout, f'{info.title} — {format_player_display(player.ip, player.usernames)}', color_start, color_stop)
+
+        if not info.data_ready:
+            warn_label = QLabel('Certaines données sont peut-être encore en chargement et manquent dans cette notification')
+            warn_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            warn_label.setWordWrap(True)
+            warn_label.setStyleSheet(DETECTION_WARN_LABEL_STYLESHEET)
+            outer_layout.addWidget(warn_label)
+
+        scroll_layout = self._init_scroll_area(outer_layout)
+
+        self._build_player_group(scroll_layout, player, info, color_start)
+        self._build_connection_group(scroll_layout, player)
+        self._build_location_group(scroll_layout, player)
+        self._build_network_group(scroll_layout, player)
+        self._build_flags_group(scroll_layout, player)
+        scroll_layout.addStretch(1)
+
+        self._add_close_button_box(outer_layout)
+
+    def _build_player_group(self, parent_layout: QVBoxLayout, player: Player, info: PlayerDetectionInfo, accent: str) -> None:
+        """Add the 'Player Details' section."""
+        group, form = self._make_group('Détails du joueur', accent=accent)
+        self._add_row(form, 'Event', info.description)
+        self._add_row(form, "Heure de l'événement", info.event_time)
+        self._add_row(form, f'Pseudo{pluralize(len(player.usernames))}', ', '.join(player.usernames) or 'N/A')
+        parent_layout.addWidget(group)
+
+    def _build_connection_group(self, parent_layout: QVBoxLayout, player: Player) -> None:
+        """Add the 'Connection Details' section."""
+        group, form = self._make_group('Détails de la connexion', accent='#cb1099')
+        self._add_row(form, 'IP Address', player.ip)
+        self._add_row(form, 'Hostname', format_text(player.reverse_dns.hostname))
+        self._add_row(form, 'First Port', str(player.ports.first))
+        self._add_row(form, 'Port(s) intermédiaire(s)', ', '.join(map(str, reversed(player.ports.middle))) or '')
+        self._add_row(form, 'Last Port', str(player.ports.last))
+        self._add_row(form, 'Total des paquets échangés', str(player.packets.total_exchanged))
+        self._add_row(form, 'Paquets de la session', str(player.packets.exchanged))
+        self._add_row(form, 'Rejoins', str(player.rejoins))
+        parent_layout.addWidget(group)
+
+    def _build_location_group(self, parent_layout: QVBoxLayout, player: Player) -> None:
+        """Add the 'Location Details' section."""
+        group, form = self._make_group('Localisation', accent='#38a169')
+        continent = format_text(player.iplookup.ipapi.continent)
+        continent_code = format_text(player.iplookup.ipapi.continent_code)
+        continent_display = f'{continent} ({continent_code})' if continent != 'N/A' and continent_code != 'N/A' else continent
+        country = format_text(player.iplookup.ipapi.country)
+        country_code = format_text(player.iplookup.ipapi.country_code)
+        country_display = f'{country} ({country_code})' if country != 'N/A' and country_code != 'N/A' else country
+        region = format_text(player.iplookup.ipapi.region)
+        region_code = format_text(player.iplookup.ipapi.region_code)
+        region_display = f'{region} ({region_code})' if region != 'N/A' and region_code != 'N/A' else region
+        self._add_row(form, 'Continent', continent_display)
+        self._add_row(form, 'Country', country_display)
+        self._add_row(form, 'Region', region_display)
+        parent_layout.addWidget(group)
+
+    def _build_network_group(self, parent_layout: QVBoxLayout, player: Player) -> None:
+        """Add the 'Network Details' section."""
+        group, form = self._make_group('Réseau', accent='#d69e2e')
+        self._add_row(form, 'ISP', format_text(player.iplookup.ipapi.isp))
+        self._add_row(form, 'Organisation', format_text(player.iplookup.ipapi.org))
+        asn = format_text(player.iplookup.ipapi.asn)
+        as_name = format_text(player.iplookup.ipapi.as_name)
+        asn_display = f'{asn} ({as_name})' if asn != 'N/A' and as_name != 'N/A' else asn
+        self._add_row(form, 'ASN', asn_display)
+        parent_layout.addWidget(group)
+
+    def _build_flags_group(self, parent_layout: QVBoxLayout, player: Player) -> None:
+        """Add the 'Detection Flags' section."""
+        group, form = self._make_group('Indicateurs', accent='#7e54db')
+        self._add_row(form, 'Mobile (cellulaire)', format_bool(player.iplookup.ipapi.mobile))
+        self._add_row(form, 'Proxy / VPN / Tor', format_bool(player.iplookup.ipapi.proxy))
+        self._add_row(form, 'Hébergeur / Datacenter', format_bool(player.iplookup.ipapi.hosting))
+        parent_layout.addWidget(group)
+
+
+_active_player_detection_dialogs: ActiveDialogRegistry[tuple[str, NotificationType], PlayerDetectionDialog] = ActiveDialogRegistry()
+
+
+def show_player_detection_dialog(
+    parent: QWidget | None,
+    player: Player,
+    info: PlayerDetectionInfo,
+) -> None:
+    """Open or focus the Player Detection dialog for *player*."""
+    _active_player_detection_dialogs.show_or_focus((player.ip, info.event_type), lambda: PlayerDetectionDialog(parent, player, info))

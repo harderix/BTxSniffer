@@ -1,0 +1,100 @@
+"""Networking-related custom exceptions.
+
+This module contains custom exception classes for networking operations.
+"""
+
+
+class InvalidMacAddressError(Exception):
+    """Exception raised when an invalid MAC address is found."""
+
+    def __init__(self, mac_address: str) -> None:
+        """Initialize the exception with the invalid MAC address.
+
+        Args:
+            mac_address: The invalid MAC address that caused the error.
+        """
+        super().__init__(f'Invalid MAC address: {mac_address}\nA MAC address must be a 12-digit hexadecimal number long.')
+
+
+class InvalidIPv4AddressError(Exception):
+    """Exception raised when an invalid IPv4 address is found."""
+
+    def __init__(self, ipv4_address: str) -> None:
+        """Initialize the exception with the invalid IPv4 address.
+
+        Args:
+            ipv4_address: The invalid IPv4 address that caused the error.
+        """
+        super().__init__(f'Invalid IPv4 address: {ipv4_address}')
+
+
+class ManufLineParseError(ValueError):
+    """Exception raised when parsing a manuf line fails."""
+
+    def __init__(self, line: str) -> None:
+        """Initialize the exception with the failed line."""
+        super().__init__(f'Failed to parse manuf line: {line!r}')
+
+
+class InvalidManufEntryFieldError(TypeError):
+    """Base class for all ManufEntry field type errors."""
+
+    def __init__(self, field_name: str, value: object) -> None:
+        """Initialize the exception with field information."""
+        super().__init__(
+            f'Invalid type for {field_name}: expected str but got {type(value).__name__} ({value!r})',
+        )
+
+
+class InvalidMacAddressBlockError(InvalidManufEntryFieldError):
+    """Exception raised when `mac_address_block` is invalid."""
+
+    def __init__(self, value: object) -> None:
+        """Initialize the exception with the invalid MAC address block."""
+        super().__init__('mac_address_block', value)
+
+
+class InvalidPrefixLengthBitsError(InvalidManufEntryFieldError):
+    """Exception raised when `prefix_length_bits` is invalid."""
+
+    def __init__(self, value: object) -> None:
+        """Initialize the exception with the invalid prefix length (bits)."""
+        super().__init__('prefix_length_bits', value)
+
+
+class InvalidShortNameError(InvalidManufEntryFieldError):
+    """Exception raised when `short_name` is invalid."""
+
+    def __init__(self, value: object) -> None:
+        """Initialize the exception with the invalid short name."""
+        super().__init__('short_name', value)
+
+
+class InvalidFullVendorNameError(InvalidManufEntryFieldError):
+    """Exception raised when the full vendor name is invalid."""
+
+    def __init__(self, value: object) -> None:
+        """Initialize the exception with the invalid full vendor name."""
+        super().__init__('full_vendor_name', value)
+
+
+class AllEndpointsExhaustedError(Exception):
+    """Exception raised when all endpoints have been exhausted."""
+
+    def __init__(self) -> None:
+        """Initialize the exception with a default message."""
+        super().__init__('All ping endpoints have been exhausted')
+
+
+class InterfaceAlreadyExistsError(Exception):
+    """Raised when attempting to add a network interface that already exists."""
+
+    def __init__(self, index: int, name: str | None = None) -> None:
+        """Initialize the exception with interface identity details.
+
+        Args:
+            index: Interface index.
+            name: Optional interface name.
+        """
+        details = f'index={index}' + (f', name="{name}"' if name else '')
+        super().__init__(f'Interface already exists in registry ({details})')

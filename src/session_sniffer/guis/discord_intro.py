@@ -1,0 +1,199 @@
+"""Discord intro popup dialog and clickable label widgets."""
+
+import sys
+import webbrowser
+from typing import TYPE_CHECKING, override
+
+from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, Qt, Signal
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QSpacerItem, QVBoxLayout, QWidget
+
+from session_sniffer.constants.local import RESOURCES_DIR_PATH
+from session_sniffer.constants.standalone import DISCORD_INVITE_URL, TITLE
+from session_sniffer.guis.app import app
+from session_sniffer.guis.exceptions import PrimaryScreenNotFoundError
+from session_sniffer.guis.stylesheets import (
+    DISCORD_POPUP_EXIT_BUTTON_STYLESHEET,
+    DISCORD_POPUP_JOIN_BUTTON_STYLESHEET,
+    DISCORD_POPUP_MAIN_STYLESHEET,
+)
+from session_sniffer.settings import Settings
+
+if TYPE_CHECKING:
+    from PySide6.QtGui import QMouseEvent
+
+
+class ClickableLabel(QLabel):
+    """Emit a signal when the label is clicked."""
+
+    clicked = Signal()
+
+    @override
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        """Emit `clicked` when left mouse button is pressed."""
+        if event and event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class DiscordIntro(QDialog):
+    """Show a modal dialog inviting the user to join the Discord server."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """Initialize the Discord community intro dialog."""
+        super().__init__(parent)
+
+        window_title = 'Rejoins le Discord BTX !'
+
+        # Modeless: must not block the main window, otherwise Windows greys out
+        # the main window's native close (X) button while this dialog is open.
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+        self.setWindowTitle(window_title)
+        self.setMinimumSize(460, 160)
+        # NOTE: Qt.Tool is deliberately omitted. On Windows a Qt.Tool window is created as a
+        # WS_EX_TOOLWINDOW owned by the active top-level window (the main window) even when it
+        # has no Qt parent, and that owner relationship leaves the main window's native close (X)
+        # button rendered as disabled while this popup is alive. FramelessWindowHint | Dialog gives
+        # the same borderless custom-chrome look without the owner-window side effect.
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog)  # | Qt.WindowType.WindowStaysOnTopHint
+
+        if sys.platform == 'win32':
+            self.setWindowOpacity(0)
+            self.fade_out = QPropertyAnimation(self, b'windowOpacity')
+
+        self.setStyleSheet(DISCORD_POPUP_MAIN_STYLESHEET)
+
+        self.exit_button = QPushButton('x', self)
+        self.exit_button.setFixedSize(16, 16)
+        self.exit_button.setToolTip('Fermer cette fenêtre')
+        self.exit_button.setStyleSheet(DISCORD_POPUP_EXIT_BUTTON_STYLESHEET)
+        self.exit_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.exit_button.clicked.connect(self.close_popup)
+
+        layout = QVBoxLayout()
+        exit_layout = QHBoxLayout()
+        exit_layout.addStretch(1)
+        exit_layout.addWidget(self.exit_button)
+        layout.addLayout(exit_layout)
+
+        self.title_label = QLabel(f"<font size='6' color='#f258c9'><b>{window_title}</b></font>", self)
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.title_label)
+        layout.addItem(QSpacerItem(0, 4, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding))
+
+        self.join_button = QPushButton(f'Rejoindre le Discord {TITLE} !', self)
+        self.join_button.setIcon(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'discord.svg')))
+        self.join_button.setToolTip('Ouvrir Discord et rejoindre le serveur de la communauté BTX')
+        self.join_button.setStyleSheet(DISCORD_POPUP_JOIN_BUTTON_STYLESHEET)
+        self.join_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.join_button.clicked.connect(self.open_discord)
+
+        self.join_button.setMaximumWidth(int(self.width() * 0.75))
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        button_layout.addWidget(self.join_button)
+        button_layout.addStretch(1)
+        layout.addLayout(button_layout)
+
+        self.dont_remind_me_label = ClickableLabel("<font size='3' color='#b2a5bb'><u>Ne plus me le rappeler</u></font>", self)
+        self.dont_remind_me_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dont_remind_me_label.setToolTip('Ne plus jamais afficher cette fenêtre Discord')
+        self.dont_remind_me_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.dont_remind_me_label.clicked.connect(self.dont_remind_me)
+
+        layout.addItem(QSpacerItem(0, 10, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding))
+        layout.addWidget(self.dont_remind_me_label)
+
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        self.setLayout(layout)
+        self.show()
+        self.center_window()
+
+        if sys.platform == 'win32':
+            self.fade_in = QPropertyAnimation(self, b'windowOpacity')
+            self.fade_in.setDuration(1000)
+            self.fade_in.setStartValue(0)
+            self.fade_in.setEndValue(1)
+            self.fade_in.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self.fade_in.start()
+
+        self.raise_()
+        self.activateWindow()
+
+        self._drag_pos: QPoint | None = None
+
+    @override
+    def mousePressEvent(self, a0: QMouseEvent) -> None:
+        """Begin drag when clicking the dialog background."""
+        if (
+            a0
+            and a0.button() == Qt.MouseButton.LeftButton
+            and not self.exit_button.underMouse()
+            and not self.join_button.underMouse()
+            and not self.dont_remind_me_label.underMouse()
+        ):
+            self._drag_pos = a0.globalPosition().toPoint()
+
+        super().mousePressEvent(a0)
+
+    @override
+    def mouseMoveEvent(self, a0: QMouseEvent) -> None:
+        """Move the dialog while dragging."""
+        if a0 and self._drag_pos:
+            delta = a0.globalPosition().toPoint() - self._drag_pos
+            self.move(self.pos() + delta)
+            self._drag_pos = a0.globalPosition().toPoint()
+
+        super().mouseMoveEvent(a0)
+
+    @override
+    def mouseReleaseEvent(self, a0: QMouseEvent) -> None:
+        """Stop dragging the dialog on mouse release."""
+        self._drag_pos = None
+
+        super().mouseReleaseEvent(a0)
+
+    def center_window(self) -> None:
+        """Center the dialog on the primary screen."""
+        screen = app.primaryScreen()
+        if not screen:
+            raise PrimaryScreenNotFoundError
+
+        screen_geometry = screen.geometry()
+        x_position = (screen_geometry.width() - self.width()) // 2
+        y_position = (screen_geometry.height() - self.height()) // 2
+        self.move(x_position, y_position)
+
+    def open_discord(self) -> None:
+        """Open the Discord invite URL and disable future popup reminders."""
+        webbrowser.open(DISCORD_INVITE_URL)
+
+        if Settings.show_discord_popup:
+            Settings.show_discord_popup = False
+            Settings.rewrite_settings_file()
+
+        self.close_popup()
+
+    def dont_remind_me(self) -> None:
+        """Disable future Discord popup reminders and close the dialog."""
+        if Settings.show_discord_popup:
+            Settings.show_discord_popup = False
+            Settings.rewrite_settings_file()
+
+        self.close_popup()
+
+    def close_popup(self) -> None:
+        """Fade out and close the Discord popup dialog."""
+        if sys.platform != 'win32' or not hasattr(self, 'fade_out'):
+            self.close()
+            return
+        self.fade_out.setDuration(500)
+        self.fade_out.setStartValue(1)
+        self.fade_out.setEndValue(0)
+        self.fade_out.setEasingCurve(QEasingCurve.Type.InCubic)
+        self.fade_out.finished.connect(self.close)
+        self.fade_out.start()

@@ -1,0 +1,252 @@
+"""Interface selection dialog QSS — static containers, table, checkboxes, and scaled buttons."""
+
+# =============================================================================
+# INTERFACE SELECTION DIALOG STYLES
+# =============================================================================
+
+INTERFACE_TABLE_CONTAINER_STYLESHEET = 'QFrame#tableContainer { border: 1px solid #d3119f; border-radius: 6px;}'
+
+INTERFACE_BOTTOM_CONTAINER_STYLESHEET = (
+    'QFrame#bottomContainer {'
+    ' background-color: #2b1a35;'
+    ' border: 1px solid #d3119f;'
+    ' border-radius: 6px;'
+    '}'
+    'QFrame#bottomContainer QCheckBox {'
+    ' background-color: transparent;'
+    '}'
+    'QFrame#bottomContainer QLabel {'
+    ' background-color: transparent;'
+    '}'
+)
+
+INTERFACE_BOTTOM_SEPARATOR_STYLESHEET = 'QFrame#bottomSeparator { background-color: #492b5a; max-height: 1px; border: none;}'
+
+
+def interface_header_label_stylesheet(ui_scale: float) -> str:
+    """Return the QSS for the interface selection dialog title label at the given UI `scale`."""
+
+    def scale(value: int) -> int:
+        return max(1, round(value * ui_scale))
+
+    return f'QLabel#dialogTitleLabel {{ color: #f9effa; font-size: {scale(17)}pt; font-weight: 700; padding-top: {scale(6)}px; padding-bottom: {scale(6)}px;}}'
+
+
+def interface_table_stylesheet(ui_scale: float) -> str:
+    """Return the QSS for the interface selection table widget at the given UI `scale`."""
+
+    def scale(value: int) -> int:
+        return max(1, round(value * ui_scale))
+
+    return (
+        'QTableWidget {'
+        ' background-color: #23132c;'
+        ' alternate-background-color: #2b1836;'
+        ' border: none;'
+        ' outline: none;'
+        '}'
+        'QTableWidget::item {'
+        f' font-size: {scale(9)}pt;'
+        ' color: #f7a1e0;'
+        f' padding: 0px {scale(8)}px;'
+        ' border-bottom: 1px solid #391e48;'
+        ' border-right: 1px solid #391e48;'
+        '}'
+        'QTableWidget::item:selected {'
+        ' background-color: #c61096;'
+        ' color: #ffffff;'
+        f' padding: 0px {scale(8)}px;'
+        ' border-bottom: 1px solid #391e48;'
+        ' border-right: 1px solid #391e48;'
+        '}'
+        'QTableWidget::item:hover:!selected {'
+        ' background-color: #3d1c50;'
+        ' border-bottom: 1px solid #391e48;'
+        ' border-right: 1px solid #391e48;'
+        '}'
+        'QHeaderView {'
+        ' background-color: #1c0e24;'
+        ' border: none;'
+        ' border-bottom: 2px solid #c61096;'
+        '}'
+        'QHeaderView::section {'
+        ' background-color: #1c0e24;'
+        ' color: #f25dca;'
+        f' min-height: {scale(36)}px;'
+        f' padding: 0px {scale(8)}px;'
+        ' border-bottom: 2px solid #c61096;'
+        ' border-right: 1px solid #391e48;'
+        ' border-top: none;'
+        ' border-left: none;'
+        '}'
+    )
+
+
+def interface_checkbox_stylesheet(obj_name: str, ui_scale: float) -> str:
+    """Return the QSS for an interface selection dialog checkbox at the given UI `scale`."""
+
+    def scale(value: int) -> int:
+        return max(1, round(value * ui_scale))
+
+    return f'QCheckBox#{obj_name} {{ font-size: {scale(13)}pt; }} QCheckBox#{obj_name}::indicator {{ width: {scale(19)}px; height: {scale(19)}px; }}'
+
+
+def interface_instruction_label_stylesheet(scale: float) -> str:
+    """Return the QSS for the interface selection dialog instruction label at the given UI `scale`."""
+    return f'font-size: {max(1, round(13 * scale))}pt;'
+
+
+# =============================================================================
+# INTERFACE SELECTION DIALOG BUTTON STYLES (SCALED)
+# =============================================================================
+
+
+def interface_select_button_disabled_style(scale: float) -> str:
+    """Return the QSS for the interface selection dialog Select button in its disabled/greyed state at the given UI `scale`."""
+    font_size = max(1, round(20 * scale))
+    return f'QPushButton {{ font-size: {font_size}pt; background-color: #4d2e67; color: #ac9eb6; border: 2px solid #342046; border-radius: 10px;}}'
+
+
+def interface_select_button_enabled_style(scale: float) -> str:
+    """Return the QSS for the interface selection dialog Select button in its enabled state at the given UI `scale`."""
+    font_size = max(1, round(22 * scale))
+    return (
+        'QPushButton {'
+        f' font-size: {font_size}pt;'
+        ' background-color: #c61096;'
+        ' color: #ffffff;'
+        ' border: 2px solid #c61096;'
+        ' border-radius: 10px;'
+        '}'
+        'QPushButton:hover {'
+        ' background-color: #d411a0;'
+        ' border: 2px solid #ee30bb;'
+        '}'
+    )
+
+
+def interface_secondary_button_enabled_style(scale: float) -> str:
+    """Return the QSS for a secondary action button in the interface selection dialog in its enabled state at the given UI `scale`."""
+    font_size = max(1, round(14 * scale))
+    padding_v = max(1, round(4 * scale))
+    padding_h = max(1, round(10 * scale))
+    return (
+        'QPushButton {'
+        f' font-size: {font_size}pt;'
+        ' background-color: #3c214c;'
+        ' color: #f7a1e0;'
+        ' border: 2px solid #481e60;'
+        ' border-radius: 8px;'
+        f' padding: {padding_v}px {padding_h}px;'
+        '}'
+        'QPushButton:hover {'
+        ' background-color: #c61096;'
+        ' border: 2px solid #c61096;'
+        '}'
+    )
+
+
+def interface_secondary_button_disabled_style(scale: float) -> str:
+    """Return the QSS for a secondary action button in the interface selection dialog in its disabled (greyed-out) state at the given UI `scale`."""
+    font_size = max(1, round(14 * scale))
+    padding_v = max(1, round(4 * scale))
+    padding_h = max(1, round(10 * scale))
+    return (
+        'QPushButton {'
+        f' font-size: {font_size}pt;'
+        ' background-color: #4d2e67;'
+        ' color: #ac9eb6;'
+        ' border: 2px solid #342046;'
+        ' border-radius: 8px;'
+        f' padding: {padding_v}px {padding_h}px;'
+        '}'
+    )
+
+
+def format_interface_refresh_arp_progress_style(ui_scale: float, fraction: float, *, dimmed: bool = False) -> str:
+    """Build a QSS that renders a horizontal gradient progress fill inside the Refresh ARP button.
+
+    Designed to match the dialog's deep-blue palette (Start button `#c61096`,
+    button base `#3c214c`). The fill animates a bright accent gradient over a
+    darker track to read clearly against the dialog's bottom container.
+    When `dimmed` is True, grey colors are used to signal the button will be disabled on completion.
+    """
+    if dimmed:
+        _fill_left = '#43285a'
+        _fill_mid = '#685874'
+        _fill_right = '#7d698b'
+        _track_dark = '#1b1024'
+        _track_light = '#2a1938'
+    else:
+        _fill_left = '#c61096'
+        _fill_mid = '#ec15b3'
+        _fill_right = '#f042c1'
+        _track_dark = '#1f0f28'
+        _track_light = '#2d1a38'
+    clamped = max(0.0, min(1.0, fraction))
+    next_stop = min(1.0, clamped + 0.0001)
+    font_size = max(1, round(12 * ui_scale))
+    padding_v = max(1, round(4 * ui_scale))
+    padding_h = max(1, round(10 * ui_scale))
+    return (
+        'QPushButton {'
+        f' font-size: {font_size}pt;'
+        ' background: qlineargradient(x1:0, y1:0, x2:1, y2:0,'
+        f' stop:0 {_fill_left},'
+        f' stop:{clamped * 0.5:.4f} {_fill_mid},'
+        f' stop:{clamped:.4f} {_fill_right},'
+        f' stop:{next_stop:.4f} {_track_dark},'
+        f' stop:1 {_track_light});'
+        ' color: #ffffff;'
+        ' font-weight: 700;'
+        ' letter-spacing: 1px;'
+        ' border: 2px solid #c61096;'
+        ' border-radius: 8px;'
+        f' padding: {padding_v}px {padding_h}px;'
+        ' }'
+    )
+
+
+def interface_tab_container_stylesheet(ui_scale: float) -> str:
+    """Return the QSS for the segmented navigation tab bar container at the given UI `scale`."""
+
+    def scale(value: int) -> int:
+        return max(1, round(value * ui_scale))
+
+    return f'QFrame#interfaceTabContainer {{ background-color: #180b20; border: 1px solid #331a42; border-radius: {scale(8)}px; padding: {scale(4)}px;}}'
+
+
+def interface_tab_button_stylesheet(ui_scale: float) -> str:
+    """Return the QSS for segmented navigation tab buttons at the given UI `scale`."""
+
+    def scale(value: int) -> int:
+        return max(1, round(value * ui_scale))
+
+    return (
+        'QPushButton#tabInterfacesButton, QPushButton#tabHotspotButton {'
+        f' font-size: {scale(10)}pt;'
+        ' font-weight: 600;'
+        ' color: #ac6ebb;'
+        ' background-color: transparent;'
+        ' border: 1px solid transparent;'
+        f' border-radius: {scale(6)}px;'
+        f' padding: {scale(8)}px {scale(20)}px;'
+        f' min-height: {scale(34)}px;'
+        ' text-align: center;'
+        '}'
+        'QPushButton#tabInterfacesButton:hover:!checked, QPushButton#tabHotspotButton:hover:!checked {'
+        ' background-color: rgba(255, 255, 255, 0.04);'
+        ' color: #f7a1e0;'
+        '}'
+        'QPushButton#tabInterfacesButton:checked, QPushButton#tabHotspotButton:checked {'
+        ' background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(0, 191, 216, 0.22), stop:1 rgba(0, 191, 216, 0.06));'
+        ' border: 1px solid #00bfd8;'
+        ' color: #ffffff;'
+        ' font-weight: 700;'
+        '}'
+        'QPushButton#tabInterfacesButton:checked:hover, QPushButton#tabHotspotButton:checked:hover {'
+        ' background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(248, 56, 197, 0.28), stop:1 rgba(248, 56, 197, 0.10));'
+        ' border: 1px solid #f838c5;'
+        ' color: #ffffff;'
+        '}'
+    )

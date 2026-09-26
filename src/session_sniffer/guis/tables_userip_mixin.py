@@ -1,0 +1,827 @@
+"""UserIP database operations for the session table context menu."""
+
+import re
+from typing import TYPE_CHECKING
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QInputDialog, QLineEdit, QMessageBox, QWidget
+
+from session_sniffer.constants.local import USERIP_DATABASES_DIR_PATH
+from session_sniffer.constants.standalone import GITHUB_WIKI_SCRIPT_CONFIG_URL, TITLE
+from session_sniffer.guis.select_usernames_dialog import SelectUsernamesDialog
+from session_sniffer.guis.userip_manager_helpers import IPRangeBuilderDialog
+from session_sniffer.networking.ip_range import check_ip_against_ranges, parse_ip_range_entry
+from session_sniffer.player.registry import PlayersRegistry
+from session_sniffer.player.userip import UserIPDatabases
+from session_sniffer.text_templates import (
+    DEFAULT_USERIP_FILES_SETTINGS_INI,
+    USERIP_DEFAULT_DB_FOOTER_TEMPLATE,
+    USERIP_DEFAULT_DB_HEADER_TEMPLATE,
+)
+from session_sniffer.text_utils import format_triple_quoted_text, pluralize
+from session_sniffer.utils import dedup_preserve_order, write_lines_to_file
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from session_sniffer.models.player import Player
+
+RE_USERIP_INI_PARSER_PATTERN = re.compile(r'^(?![;#])(?P<username>[^=]+)=(?P<ip>[^;#]+)')
+
+
+def ensure_searchlist_database() -> Path:
+    """Return the `Path` to `Searchlist.ini`, creating it with the default template if missing."""
+    searchlist_path = USERIP_DATABASES_DIR_PATH / 'Searchlist.ini'
+    if searchlist_path.is_file():
+        return searchlist_path
+    for candidate in USERIP_DATABASES_DIR_PATH.rglob('Searchlist.ini'):
+        if candidate.is_file():
+            return candidate
+    USERIP_DATABASES_DIR_PATH.mkdir(parents=True, exist_ok=True)
+    header = format_triple_quoted_text(
+        USERIP_DEFAULT_DB_HEADER_TEMPLATE.format(
+            title=TITLE,
+            configuration_guide_url=GITHUB_WIKI_SCRIPT_CONFIG_URL,
+        ),
+    )
+    settings = DEFAULT_USERIP_FILES_SETTINGS_INI.get('Searchlist.ini', '').strip()
+    footer = format_triple_quoted_text(USERIP_DEFAULT_DB_FOOTER_TEMPLATE, add_trailing_newline=True)
+    searchlist_path.write_text(f'{header}\n{settings}\n{footer}', encoding='utf-8')
+    return searchlist_path
+
+
+def _show_modal_info_on_top(parent: QWidget, title: str, text: str) -> None:
+    """Show a modal information message box that stays on top of other windows."""
+    message_box = QMessageBox(parent)
+    message_box.setIcon(QMessageBox.Icon.Information)
+    message_box.setWindowTitle(title)
+    message_box.setText(text)
+    message_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+    message_box.setWindowModality(Qt.WindowModality.WindowModal)
+    message_box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+    message_box.exec()
+
+
+def _entry_ip_matches_any(entry_ip: str, selected_ips: list[str]) -> bool:
+    """Return True if *entry_ip* exactly matches or is a range containing any IP in *selected_ips*."""
+    if entry_ip in selected_ips:
+        return True
+    try:
+        ranges = parse_ip_range_entry(entry_ip)
+    except ValueError:
+        return False
+    return any(check_ip_against_ranges(selected_ip, ranges) is not None for selected_ip in selected_ips)
+
+
+def resolve_usernames_for_player(player: Player) -> list[str]:
+    """Return deduplicated usernames associated with the given player from all sources."""
+    player_names = dedup_preserve_order(
+        [player.ps3_username] if player.ps3_username else [],
+        player.userip.usernames if player.userip else [],
+        player.mod_menus.usernames if player.mod_menus else [],
+        player.looky_system.usernames if player.looky_system.is_initialized else [],
+        player.usernames,
+    )
+    return [stripped for name in player_names if (stripped := name.strip())]
+
+
+def resolve_usernames_for_ips(selected_ips: list[str]) -> list[str]:
+    """Return deduplicated usernames associated with the given IP addresses from the player registry."""
+    all_usernames: list[str] = []
+    for ip_address in selected_ips:
+        player = PlayersRegistry.get_player_by_ip(ip_address)
+        if player is not None:
+            all_usernames.extend(resolve_usernames_for_player(player))
+    return dedup_preserve_order(all_usernames)
+
+
+def _prompt_usernames_to_add(
+    parent: QWidget,
+    selected_ips: list[str],
+    selected_database: Path,
+    *,
+    candidate_usernames: list[str] | None = None,
+    prompt_message: str | None = None,
+) -> list[str] | None:
+    """Prompt the user for one or more usernames to associate with the selected IP(s).
+
+    If exactly one username is found/provided, pre-fills the input dialog.
+    If multiple usernames are found, shows a selection dialog to pick which one(s) to add.
+    If no usernames are found, displays a standard blank input dialog.
+
+    Returns a non-empty list of chosen usernames, or None if cancelled/empty.
+    """
+    candidates = (
+        [name.strip() for name in dedup_preserve_order(candidate_usernames) if name.strip()]
+        if candidate_usernames is not None
+        else resolve_usernames_for_ips(selected_ips)
+    )
+
+    db_display = str(selected_database.relative_to(USERIP_DATABASES_DIR_PATH).with_suffix(''))
+
+    if len(candidates) > 1:
+        dialog = SelectUsernamesDialog.for_add(
+            parent,
+            candidates,
+            database=db_display,
+            selected_ips=selected_ips,
+        )
+        if dialog.exec() != SelectUsernamesDialog.DialogCode.Accepted:
+            return None
+
+        if not dialog.custom_requested():
+            selected = dialog.selected_usernames()
+            if not selected:
+                return None
+            return selected
+
+        # User clicked 'Custom…' in the selection dialog
+        selected_candidates = dialog.selected_usernames()
+        initial_text = ', '.join(selected_candidates)
+        usernames_count = len(selected_candidates) or 1
+    elif len(candidates) == 1:
+        initial_text = candidates[0]
+        usernames_count = 1
+    else:
+        initial_text = ''
+        usernames_count = 1
+
+    if prompt_message is None:
+        prompt_message = f'Entre le pseudo{pluralize(usernames_count)} à associer aux IP{pluralize(len(selected_ips))} sélectionnées :'
+
+    entered_username, success = QInputDialog.getText(
+        parent,
+        'Input Username',
+        prompt_message,
+        QLineEdit.EchoMode.Normal,
+        initial_text,
+    )
+
+    if not success:
+        return None
+
+    entered_usernames = [name.strip() for name in dedup_preserve_order(entered_username.split(',')) if name.strip()]
+    if not entered_usernames:
+        QMessageBox.warning(parent, TITLE, 'ERREUR :\nAucun pseudo fourni.')
+        return None
+
+    return entered_usernames
+
+
+def userip_add(
+    parent: QWidget,
+    selected_ips: list[str],
+    selected_database: Path,
+    *,
+    default_username: str = '',
+    usernames: list[str] | None = None,
+) -> None:
+    """Add the selected IP address(es) to the chosen UserIP database."""
+    candidates = list(usernames) if usernames is not None else ([default_username] if default_username else None)
+    chosen_usernames = _prompt_usernames_to_add(
+        parent,
+        selected_ips,
+        selected_database,
+        candidate_usernames=candidates,
+    )
+    if not chosen_usernames:
+        return
+
+    new_lines = [f'{username}={ip_address}\n' for username in chosen_usernames for ip_address in selected_ips]
+    write_lines_to_file(selected_database, 'a', new_lines)
+
+    db_display = selected_database.relative_to(USERIP_DATABASES_DIR_PATH).with_suffix('')
+    usernames_display = ', '.join(f'"{name}"' for name in chosen_usernames)
+    _show_modal_info_on_top(
+        parent,
+        TITLE,
+        (
+            f'Selected IP{pluralize(len(selected_ips))} {list(selected_ips)} '
+            f'ha{pluralize(len(selected_ips), singular="s", plural="ve")} been added with username{pluralize(len(chosen_usernames))} '
+            f'{usernames_display} to UserIP database "{db_display}".'
+        ),
+    )
+
+
+def userip_add_as_range(
+    parent: QWidget,
+    ip_address: str,
+    selected_database: Path,
+    *,
+    default_username: str = '',
+    usernames: list[str] | None = None,
+) -> None:
+    """Add the selected IP address as a range entry to the chosen UserIP database."""
+    range_dialog = IPRangeBuilderDialog(parent, initial_ip=ip_address, allow_single_ip=False)
+    if range_dialog.exec() != IPRangeBuilderDialog.DialogCode.Accepted:
+        return
+
+    range_input = range_dialog.result_entry()
+    if not range_input:
+        return
+
+    candidates = list(usernames) if usernames is not None else ([default_username] if default_username else None)
+    prompt_message = f'Entre le pseudo à associer à la plage "{range_input}" :'
+    chosen_usernames = _prompt_usernames_to_add(
+        parent,
+        [ip_address],
+        selected_database,
+        candidate_usernames=candidates,
+        prompt_message=prompt_message,
+    )
+    if not chosen_usernames:
+        return
+
+    new_lines = [f'{username}={range_input}\n' for username in chosen_usernames]
+    write_lines_to_file(selected_database, 'a', new_lines)
+
+    db_display = selected_database.relative_to(USERIP_DATABASES_DIR_PATH).with_suffix('')
+    usernames_display = ', '.join(f'"{name}"' for name in chosen_usernames)
+    _show_modal_info_on_top(
+        parent,
+        TITLE,
+        f'Range "{range_input}" has been added with username{pluralize(len(chosen_usernames))} {usernames_display} to UserIP database "{db_display}".',
+    )
+
+
+def userip_convert_to_range(parent: QWidget, ip_address: str, player: Player) -> None:
+    """Convert a single-IP UserIP entry into a range entry in place, keeping its username(s).
+
+    Useful when an IP that was tagged with a username later turns out to belong to a
+    VPN/subnet: instead of deleting the entry and re-adding it as a range, every exact
+    single-IP line matching `ip_address` is rewritten to the range built via the dialog.
+    """
+    if player.userip is None or not player.userip.usernames:
+        return
+
+    range_dlg = IPRangeBuilderDialog(parent, initial_ip=ip_address, allow_single_ip=False)
+    if range_dlg.exec() != IPRangeBuilderDialog.DialogCode.Accepted:
+        return
+
+    range_input = range_dlg.result_entry()
+    if not range_input:
+        return
+
+    new_lines: list[str] = []
+    converted_count = 0
+    in_userip_section = False
+    for raw_line in player.userip.db_path.read_text('utf-8').splitlines(keepends=True):
+        line = raw_line.strip()
+        if line.startswith('[') and line.endswith(']'):
+            in_userip_section = line == '[UserIP]'
+            new_lines.append(raw_line)
+            continue
+        if in_userip_section:
+            match = RE_USERIP_INI_PARSER_PATTERN.search(line)
+            if match:
+                username_raw = match.group('username')
+                ip_raw = match.group('ip')
+                if username_raw is not None and ip_raw is not None and ip_raw.strip() == ip_address:
+                    ending = raw_line[len(raw_line.rstrip()) :]
+                    new_lines.append(f'{username_raw.strip()}={range_input}{ending}')
+                    converted_count += 1
+                    continue
+        new_lines.append(raw_line)
+
+    if not converted_count:
+        QMessageBox.information(parent, TITLE, f'Aucune entrée d\'IP unique trouvée pour l\'IP {ip_address} dans la base.')
+        return
+
+    write_lines_to_file(player.userip.db_path, 'w', new_lines)
+
+    db_display = player.userip.db_path.relative_to(USERIP_DATABASES_DIR_PATH).with_suffix('')
+    _show_modal_info_on_top(
+        parent,
+        TITLE,
+        f'Converted {converted_count} {"entry" if converted_count == 1 else "entries"} for IP {ip_address} to range "{range_input}" in UserIP database "{db_display}".',
+    )
+
+
+def userip_edit_range(parent: QWidget, ip_address: str, player: Player) -> None:
+    """Edit an existing range entry that covers `ip_address` in its UserIP database, keeping its username(s).
+
+    The player's matched range is located by scanning its database for range entries that contain
+    `ip_address`. When several distinct ranges cover the IP, the user picks which one to edit. Every
+    line whose value equals the chosen range is then rewritten to the new range built via the dialog.
+    """
+    if player.userip is None:
+        return
+
+    content = player.userip.db_path.read_text('utf-8')
+
+    # Collect the distinct range strings in this database that cover the player's IP.
+    matching_ranges: list[str] = []
+    in_userip_section = False
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if line.startswith('[') and line.endswith(']'):
+            in_userip_section = line == '[UserIP]'
+            continue
+        if not in_userip_section:
+            continue
+        match = RE_USERIP_INI_PARSER_PATTERN.search(line)
+        if match is None:
+            continue
+        ip_raw = match.group('ip')
+        if ip_raw is None:
+            continue
+        entry_ip = ip_raw.strip()
+        if entry_ip not in matching_ranges and _entry_ip_matches_any(entry_ip, [ip_address]):
+            matching_ranges.append(entry_ip)
+
+    if not matching_ranges:
+        QMessageBox.information(parent, TITLE, f'Aucune plage contenant l\'IP {ip_address} trouvée dans la base.')
+        return
+
+    if len(matching_ranges) == 1:
+        old_range = matching_ranges[0]
+    else:
+        chosen, success = QInputDialog.getItem(
+            parent,
+            'Edit Range',
+            f'Multiple ranges cover IP {ip_address}.\nSelect the range to edit:',
+            matching_ranges,
+            editable=False,
+        )
+        if not success or not chosen:
+            return
+        old_range = chosen
+
+    # Single IP is allowed here so a range can be narrowed back down to one address.
+    range_dlg = IPRangeBuilderDialog(parent, initial_entry=old_range)
+    if range_dlg.exec() != IPRangeBuilderDialog.DialogCode.Accepted:
+        return
+
+    new_range = range_dlg.result_entry()
+    if not new_range or new_range == old_range:
+        return
+
+    new_lines: list[str] = []
+    edited_count = 0
+    in_userip_section = False
+    for raw_line in content.splitlines(keepends=True):
+        line = raw_line.strip()
+        if line.startswith('[') and line.endswith(']'):
+            in_userip_section = line == '[UserIP]'
+            new_lines.append(raw_line)
+            continue
+        if in_userip_section:
+            match = RE_USERIP_INI_PARSER_PATTERN.search(line)
+            if match:
+                username_raw = match.group('username')
+                ip_raw = match.group('ip')
+                if username_raw is not None and ip_raw is not None and ip_raw.strip() == old_range:
+                    ending = raw_line[len(raw_line.rstrip()) :]
+                    new_lines.append(f'{username_raw.strip()}={new_range}{ending}')
+                    edited_count += 1
+                    continue
+        new_lines.append(raw_line)
+
+    if not edited_count:
+        QMessageBox.information(parent, TITLE, f'Aucune entrée trouvée pour la plage "{old_range}" dans la base.')
+        return
+
+    write_lines_to_file(player.userip.db_path, 'w', new_lines)
+
+    db_display = player.userip.db_path.relative_to(USERIP_DATABASES_DIR_PATH).with_suffix('')
+    entry_word = 'entry' if edited_count == 1 else 'entries'
+    QMessageBox.information(
+        parent,
+        TITLE,
+        f'{edited_count} {entry_word} mis à jour de la plage "{old_range}" vers "{new_range}" dans la base UserIP "{db_display}".',
+    )
+
+
+def userip_add_username(parent: QWidget, ip_address: str, player: Player) -> None:
+    """Add an additional username for an IP address that is already in a UserIP database."""
+    if player.userip is None:
+        return
+
+    existing = ', '.join(player.userip.usernames) if player.userip.usernames else 'None'
+    username, success = QInputDialog.getText(
+        parent,
+        'Add Username',
+        f'Current usernames for {ip_address}: {existing}\n\nEnter the new username to add:',
+    )
+
+    if not success:
+        return
+
+    username = username.strip()
+
+    if username:
+        write_lines_to_file(player.userip.db_path, 'a', [f'{username}={ip_address}\n'])
+
+        db_display = player.userip.db_path.relative_to(USERIP_DATABASES_DIR_PATH).with_suffix('')
+        QMessageBox.information(
+            parent,
+            TITLE,
+            f'Le pseudo "{username}" a été ajouté pour l\'IP {ip_address} dans la base UserIP "{db_display}".',
+        )
+    else:
+        QMessageBox.warning(parent, TITLE, 'ERREUR :\nAucun pseudo fourni.')
+
+
+def _renamed_line(
+    raw_line: str,
+    pairs: list[tuple[str, str]],
+    new_username: str,
+    seen: set[str],
+) -> str | None:
+    """Return a replacement line, `None` (keep original), or `''` (drop duplicate).
+
+    Checks if `raw_line` matches any (old_username, ip) pair and returns the renamed version.
+    """
+    match = RE_USERIP_INI_PARSER_PATTERN.search(raw_line.strip())
+    if match is None:
+        return None
+    username_raw = match.group('username')
+    ip_raw = match.group('ip')
+    if username_raw is None or ip_raw is None:
+        return None
+    username, ip = username_raw.strip(), ip_raw.strip()
+    matched = next((pair for pair in pairs if pair[0] == username and _entry_ip_matches_any(ip, [pair[1]])), None)
+    if matched is None:
+        return None
+    entry_key = f'{new_username}={ip}'
+    if entry_key in seen:
+        return ''  # duplicate — drop
+    seen.add(entry_key)
+    ending = raw_line[len(raw_line.rstrip()) :]
+    return f'{new_username}={ip}{ending}'
+
+
+def _rewrite_db_for_rename(db_path: Path, pairs: list[tuple[str, str]], new_username: str) -> int:
+    """Rewrite one database file, replacing matched (old_username, ip) pairs with `new_username`.
+
+    Returns the number of lines renamed.
+    """
+    content = db_path.read_text('utf-8')
+    new_lines: list[str] = []
+    renamed_count = 0
+    seen_new_entries: set[str] = set()
+    in_userip_section = False
+
+    for raw_line in content.splitlines(keepends=True):
+        line = raw_line.strip()
+        if line.startswith('[') and line.endswith(']'):
+            in_userip_section = line == '[UserIP]'
+            new_lines.append(raw_line)
+            continue
+        if in_userip_section:
+            replacement = _renamed_line(raw_line, pairs, new_username, seen_new_entries)
+            if replacement is None:
+                new_lines.append(raw_line)
+            elif replacement:
+                new_lines.append(replacement)
+                renamed_count += 1
+            continue  # empty string → duplicate, skip
+        new_lines.append(raw_line)
+
+    if renamed_count:
+        write_lines_to_file(db_path, 'w', new_lines)
+    return renamed_count
+
+
+def userip_rename_multi(parent: QWidget, players: list[Player]) -> None:
+    """Prompt once for a new username and apply it to all selected players' IP entries."""
+    eligible = [(player.ip, player.userip) for player in players if player.userip is not None and player.userip.usernames]
+    if not eligible:
+        return
+
+    ips_display = ', '.join(ip for ip, _ in eligible)
+
+    # Pre-fill with the shared username if every selected player has exactly the same one
+    all_username_sets = [frozenset(userip.usernames) for _, userip in eligible]
+    shared_username = (
+        next(iter(all_username_sets[0])) if len(all_username_sets[0]) == 1 and all(username_set == all_username_sets[0] for username_set in all_username_sets) else ''
+    )
+
+    new_username, success = QInputDialog.getText(
+        parent,
+        'Rename Selected',
+        f'Enter a new username for {len(eligible)} selected IP(s):\n{ips_display}',
+        QLineEdit.EchoMode.Normal,
+        shared_username,
+    )
+    new_username = new_username.strip() if success else ''
+    if not new_username:
+        if success:
+            QMessageBox.warning(parent, TITLE, 'Aucun pseudo fourni.')
+        return
+
+    # Build mapping: db_path → list of (old_username, ip) pairs to rename
+    by_db: dict[Path, list[tuple[str, str]]] = {}
+    for ip, userip in eligible:
+        if userip.db_path not in by_db:
+            by_db[userip.db_path] = []
+        for old_u in userip.usernames:
+            by_db[userip.db_path].append((old_u, ip))
+
+    total_renamed = 0
+    for db_path, pairs in by_db.items():
+        total_renamed += _rewrite_db_for_rename(db_path, pairs, new_username)
+
+    if not total_renamed:
+        QMessageBox.information(parent, TITLE, 'Aucune entrée trouvée pour les IP sélectionnées.')
+        return
+
+    entry_word = 'entry' if total_renamed == 1 else 'entries'
+    QMessageBox.information(parent, TITLE, f'{total_renamed} {entry_word} renommé(s) en "{new_username}".')
+
+
+def userip_rename(parent: QWidget, ip_address: str, player: Player) -> None:
+    """Rename all entries for an IP address in its UserIP database using a picker dialog."""
+    if player.userip is None or not player.userip.usernames:
+        return
+
+    ip_usernames = list(player.userip.usernames)
+
+    # Read the database content
+    content = player.userip.db_path.read_text('utf-8')
+
+    db_display = str(player.userip.db_path.relative_to(USERIP_DATABASES_DIR_PATH).with_suffix(''))
+
+    # Step 1: Determine which username to rename
+    old_username: str | None
+    if len(ip_usernames) == 1:
+        old_username = ip_usernames[0]
+    else:
+        current_name = ', '.join(ip_usernames)
+        dialog = SelectUsernamesDialog.for_rename(
+            parent,
+            ip_usernames,
+            current_username=current_name,
+            database=db_display,
+            ip_address=ip_address,
+        )
+        old_username = dialog.selected_username() if dialog.exec() == SelectUsernamesDialog.DialogCode.Accepted else None
+        if not old_username:
+            return
+
+    # Step 2: Prompt for the new username
+    new_username, success = QInputDialog.getText(
+        parent,
+        'Rename Username',
+        f'Renaming "{old_username}" for IP {ip_address}.\nDatabase: {db_display}\n\nEnter the new username:',
+        QLineEdit.EchoMode.Normal,
+        old_username,
+    )
+    new_username = new_username.strip() if success else ''
+    if not new_username:
+        if success:
+            QMessageBox.warning(parent, TITLE, 'Aucun pseudo fourni.')
+        return
+
+    # Rewrite the database file, replacing only entries matching old_username + ip_address
+    new_lines: list[str] = []
+    renamed_count = 0
+    in_userip_section = False
+    for raw_line in content.splitlines(keepends=True):
+        line = raw_line.strip()
+        if line.startswith('[') and line.endswith(']'):
+            in_userip_section = line == '[UserIP]'
+            new_lines.append(raw_line)
+            continue
+        if in_userip_section:
+            match = RE_USERIP_INI_PARSER_PATTERN.search(line)
+            if match:
+                username_raw = match.group('username')
+                ip_raw = match.group('ip')
+                if username_raw is not None and ip_raw is not None and username_raw.strip() == old_username and _entry_ip_matches_any(ip_raw.strip(), [ip_address]):
+                    ending = raw_line[len(raw_line.rstrip()) :]
+                    new_lines.append(f'{new_username}={ip_raw.strip()}{ending}')
+                    renamed_count += 1
+                    continue
+        new_lines.append(raw_line)
+
+    if not renamed_count:
+        QMessageBox.information(parent, TITLE, f'Aucune entrée trouvée pour l\'IP {ip_address} dans la base.')
+        return
+
+    write_lines_to_file(player.userip.db_path, 'w', new_lines)
+
+    entry_word = 'entry' if renamed_count == 1 else 'entries'
+    QMessageBox.information(
+        parent,
+        TITLE,
+        f'{renamed_count} {entry_word} de l\'IP {ip_address} renommé(s) en "{new_username}" dans la base UserIP "{db_display}".',
+    )
+
+
+def userip_move(parent: QWidget, selected_ips: list[str], selected_database: Path) -> None:
+    """Move the selected IP address(es) to the chosen UserIP database."""
+    # Dictionary to store removed entries by database
+    deleted_entries_by_database: dict[Path, list[str]] = {}
+
+    # Iterate over each UserIP database
+    for db_path in UserIPDatabases.get_userip_database_filepaths():
+        if db_path == selected_database:
+            continue
+
+        # Read the database file
+        lines = db_path.read_text(encoding='utf-8').splitlines(keepends=True)
+        if not lines:
+            continue
+
+        # List to store deleted entries in this particular database
+        deleted_entries_in_this_database: list[str] = []
+
+        # Remove any lines containing the IP address
+        lines_to_keep: list[str] = []
+        for line in lines:
+            # Try to match the regex
+            match = RE_USERIP_INI_PARSER_PATTERN.search(line)
+            if match:
+                # Extract username and ip using named groups
+                username, ip = match.group('username', 'ip')
+
+                # Only process if username and ip are strings
+                if isinstance(username, str) and isinstance(ip, str):
+                    # Ensure both username and ip are non-empty strings
+                    username, ip = username.strip(), ip.strip()
+
+                    # If IP is one of the selected ones, record it as deleted and exclude this line from lines_to_keep
+                    if _entry_ip_matches_any(ip, selected_ips):
+                        deleted_entries_in_this_database.append(line.strip())  # Store the deleted entry
+                        continue  # skip appending this line
+
+            # All other lines should be kept
+            lines_to_keep.append(line)
+
+        if deleted_entries_in_this_database:
+            # Only update the database file if there were any deletions
+            write_lines_to_file(db_path, 'w', lines_to_keep)
+
+            # Store the deleted entries for this database
+            deleted_entries_by_database[db_path] = deleted_entries_in_this_database
+
+            # Move the deleted entries to the target database
+            write_lines_to_file(selected_database, 'a', [f'{entry}\n' for entry in deleted_entries_in_this_database])
+
+    # After processing all databases, show a detailed report
+    if deleted_entries_by_database:
+        report = (
+            f'<b>Selected IP{pluralize(len(selected_ips))} {selected_ips} moved from the following '
+            f'UserIP database{pluralize(len(deleted_entries_by_database))} to UserIP database '
+            f'"{selected_database.relative_to(USERIP_DATABASES_DIR_PATH).with_suffix("")}":</b><br><br><br>'
+        )
+        for db_path, deleted_entries in deleted_entries_by_database.items():
+            report += f'<b>{db_path.relative_to(USERIP_DATABASES_DIR_PATH).with_suffix("")}:</b><br>'
+            report += '<ul>'
+            for entry in deleted_entries:
+                report += f'<li>{entry}</li>'
+            report += '</ul><br>'
+        report = report.removesuffix('<br>')
+
+        QMessageBox.information(parent, TITLE, report)
+
+
+def userip_delete(parent: QWidget, selected_ips: list[str]) -> None:
+    """Remove the selected IP address(es) from all enabled UserIP databases."""
+    # Dictionary to store removed entries by database
+    deleted_entries_by_database: dict[Path, list[str]] = {}
+
+    # Iterate over each UserIP database
+    for db_path in UserIPDatabases.get_userip_database_filepaths():
+        # Read the database file
+        lines = db_path.read_text(encoding='utf-8').splitlines(keepends=True)
+        if not lines:
+            continue
+
+        # List to store deleted entries in this particular database
+        deleted_entries_in_this_database: list[str] = []
+
+        # Remove any lines containing the IP address
+        lines_to_keep: list[str] = []
+        for line in lines:
+            # Try to match the regex
+            match = RE_USERIP_INI_PARSER_PATTERN.search(line)
+            if match:
+                # Extract username and ip using named groups
+                username, ip = match.group('username', 'ip')
+
+                # Only process if username and ip are strings
+                if isinstance(username, str) and isinstance(ip, str):
+                    # Ensure both username and ip are non-empty strings
+                    username, ip = username.strip(), ip.strip()
+
+                    # If IP is one of the selected ones, record it as deleted and exclude this line from lines_to_keep
+                    if _entry_ip_matches_any(ip, selected_ips):
+                        deleted_entries_in_this_database.append(line.strip())  # Store the deleted entry
+                        continue  # skip appending this line
+
+            # All other lines should be kept
+            lines_to_keep.append(line)
+
+        if deleted_entries_in_this_database:
+            # Only update the database file if there were any deletions
+            write_lines_to_file(db_path, 'w', lines_to_keep)
+
+            # Store the deleted entries for this database
+            deleted_entries_by_database[db_path] = deleted_entries_in_this_database
+
+    # After processing all databases, show a detailed report
+    if deleted_entries_by_database:
+        report = (
+            f'<b>Selected IP{pluralize(len(selected_ips))} {selected_ips} removed from the following '
+            f'UserIP database{pluralize(len(deleted_entries_by_database))}:</b><br><br><br>'
+        )
+        for db_path, deleted_entries in deleted_entries_by_database.items():
+            report += f'<b>{db_path.relative_to(USERIP_DATABASES_DIR_PATH).with_suffix("")}:</b><br>'
+            report += '<ul>'
+            for entry in deleted_entries:
+                report += f'<li>{entry}</li>'
+            report += '</ul><br>'
+        report = report.removesuffix('<br>')
+
+        QMessageBox.information(parent, TITLE, report)
+
+
+MIN_USERNAMES_FOR_REMOVAL = 2
+
+
+def userip_remove_username(parent: QWidget, ip_address: str, player: Player) -> None:
+    """Remove selected username(s) for an IP address from its UserIP database."""
+    if player.userip is None or not player.userip.usernames:
+        return
+
+    ip_usernames = list(player.userip.usernames)
+
+    if len(ip_usernames) < MIN_USERNAMES_FOR_REMOVAL:
+        return
+
+    db_display = str(player.userip.db_path.relative_to(USERIP_DATABASES_DIR_PATH).with_suffix(''))
+    dialog = SelectUsernamesDialog.for_remove(
+        parent,
+        ip_usernames,
+        database=db_display,
+        ip_address=ip_address,
+    )
+    if dialog.exec() != SelectUsernamesDialog.DialogCode.Accepted:
+        return
+
+    selected = dialog.selected_usernames()
+    if not selected:
+        return
+
+    # If all usernames are selected, confirm and delegate to full IP deletion
+    if dialog.is_all_selected():
+        confirm = QMessageBox.question(
+            parent,
+            TITLE,
+            f'Tu as sélectionné tous les pseudos de l\'IP {ip_address}.\n\nL\'IP va être entièrement retirée de la base. Continuer ?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm == QMessageBox.StandardButton.Yes:
+            userip_delete(parent, [ip_address])
+        return
+
+    _rewrite_database_removing_usernames(parent, player.userip.db_path, ip_address, selected)
+
+
+def _rewrite_database_removing_usernames(
+    parent: QWidget,
+    db_path: Path,
+    ip_address: str,
+    selected: list[str],
+) -> None:
+    """Rewrite a UserIP database file, removing only the specified (username, ip) entries."""
+    usernames_to_remove = set(selected)
+
+    content = db_path.read_text('utf-8')
+
+    new_lines: list[str] = []
+    removed_count = 0
+    in_userip_section = False
+    for raw_line in content.splitlines(keepends=True):
+        line = raw_line.strip()
+        if line.startswith('[') and line.endswith(']'):
+            in_userip_section = line == '[UserIP]'
+            new_lines.append(raw_line)
+            continue
+        if in_userip_section:
+            match = RE_USERIP_INI_PARSER_PATTERN.search(line)
+            if match:
+                username_raw = match.group('username')
+                ip_raw = match.group('ip')
+                if username_raw is not None and ip_raw is not None and username_raw.strip() in usernames_to_remove and _entry_ip_matches_any(ip_raw.strip(), [ip_address]):
+                    removed_count += 1
+                    continue
+        new_lines.append(raw_line)
+
+    if not removed_count:
+        QMessageBox.information(parent, TITLE, f'Aucune entrée correspondante pour l\'IP {ip_address} dans la base.')
+        return
+
+    write_lines_to_file(db_path, 'w', new_lines)
+
+    db_display = db_path.relative_to(USERIP_DATABASES_DIR_PATH).with_suffix('')
+    entry_word = 'entry' if removed_count == 1 else 'entries'
+    removed_names = ', '.join(f'"{name}"' for name in selected)
+    QMessageBox.information(
+        parent,
+        TITLE,
+        f'{removed_count} {entry_word} ({removed_names}) supprimé(s) pour l\'IP {ip_address} de la base UserIP "{db_display}".',
+    )

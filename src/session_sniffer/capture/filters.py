@@ -1,0 +1,195 @@
+"""Build BPF capture filters and Python display-filter callables from current application settings."""
+
+from ipaddress import AddressValueError, IPv4Address
+from typing import TYPE_CHECKING
+
+from session_sniffer.constants.standalone import (
+    CLASSICSTUN_PORT,
+    LLMNR_PORT,
+    RAKNET_PORT,
+    SSDPP_PORT,
+    UAUDP_PORT,
+)
+from session_sniffer.networking.third_party_servers import ThirdPartyServers, is_ip_in_ranges
+from session_sniffer.settings.settings import Settings
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from session_sniffer.capture.packet_capture import Packet
+
+# https://en.wikipedia.org/wiki/Reserved_IP_addresses
+_RESERVED_NETWORK_RANGES = (
+    '0.0.0.0/8',
+    '10.0.0.0/8',
+    '100.64.0.0/10',
+    '127.0.0.0/8',
+    '169.254.0.0/16',
+    '172.16.0.0/12',
+    '192.0.0.0/24',
+    '192.0.2.0/24',
+    '192.88.99.0/24',
+    '192.168.0.0/16',
+    '198.18.0.0/15',
+    '198.51.100.0/24',
+    '203.0.113.0/24',
+    '224.0.0.0/4',
+    '233.252.0.0/24',
+    '240.0.0.0/4',
+    '255.255.255.255/32',
+)
+_RESERVED_NETWORKS_FILTER = ' or '.join(_RESERVED_NETWORK_RANGES)
+
+_RTCP_RTP_VERSION = 2
+_RTCP_PT_MIN = 200
+_RTCP_PT_MAX = 204
+_RTCP_MIN_PAYLOAD = 2
+_DTLS_CONTENT_TYPE_MIN = 20
+_DTLS_CONTENT_TYPE_MAX = 23
+
+
+def _is_rtcp(packet: Packet) -> bool:
+    """Return `True` if the packet payload looks like an RTCP packet.
+
+    RTCP is identified by: RTP version == 2 (top 2 bits of first payload byte),
+    and payload type (PT) in the range 200-204.
+    """
+    if packet.payload is None or len(packet.payload) < _RTCP_MIN_PAYLOAD:
+        return False
+    version = (packet.payload[0] >> 6) & 0x3
+    pt = packet.payload[1] & 0x7F  # strip marker bit
+    return version == _RTCP_RTP_VERSION and _RTCP_PT_MIN <= pt <= _RTCP_PT_MAX
+
+
+def _is_dtls(packet: Packet) -> bool:
+    """Return `True` if the packet payload looks like a DTLS record.
+
+    DTLS content-type bytes (first byte of UDP payload): 20-23.
+    """
+    if packet.payload is None or not packet.payload:
+        return False
+    return _DTLS_CONTENT_TYPE_MIN <= packet.payload[0] <= _DTLS_CONTENT_TYPE_MAX
+
+
+def _build_display_filter_fn(
+    excluded_protocols: list[str],
+    blocked_tps_obj_ranges: list[tuple[IPv4Address, IPv4Address]] | None = None,
+) -> Callable[[Packet], bool] | None:
+    """Build a Python callable that returns `True` when a packet should be forwarded.
+
+    Args:
+        excluded_protocols: Protocol names that require Python-level inspection.
+        blocked_tps_obj_ranges: Third-party server IP tuple ranges to block.
+
+    Returns:
+        A callable, or `None` if no Python-level filtering is needed.
+    """
+    checks: list[Callable[[Packet], bool]] = []
+
+    if 'rtcp' in excluded_protocols:
+        checks.append(lambda pkt: not _is_rtcp(pkt))
+
+    if 'dtls' in excluded_protocols:
+        checks.append(lambda pkt: not _is_dtls(pkt))
+
+    if blocked_tps_obj_ranges:
+
+        def check_tps(pkt: Packet) -> bool:
+            try:
+                src_ip = IPv4Address(pkt.ip.src)
+                dst_ip = IPv4Address(pkt.ip.dst)
+            except AddressValueError:
+                return False
+            return is_ip_in_ranges(src_ip, blocked_tps_obj_ranges) or is_ip_in_ranges(dst_ip, blocked_tps_obj_ranges)
+
+        checks.append(lambda pkt: not check_tps(pkt))
+
+    if not checks:
+        return None
+
+    def display_filter_fn(pkt: Packet) -> bool:
+        return all(check(pkt) for check in checks)
+
+    return display_filter_fn
+
+
+def build_capture_filters(
+    *,
+    capture_ip_address: str,
+    broadcast_support: bool,
+    multicast_support: bool,
+) -> tuple[str | None, Callable[[Packet], bool] | None]:
+    """Build a BPF capture filter string and an optional Python display-filter callable.
+
+    Protocol exclusions that map cleanly to fixed port numbers are added directly
+    to the BPF capture filter (strategy A). Protocols requiring payload inspection
+    (rtcp, dtls) are returned as a Python callable (strategy B).
+
+    Args:
+        capture_ip_address: The IP address of the capture interface to filter on.
+        broadcast_support: Whether the interface supports the `broadcast` BPF term.
+        multicast_support: Whether the interface supports the `multicast` BPF term.
+
+    Returns:
+        A `(capture_filter_str, display_filter_fn)` tuple. Either element may be
+        `None` when no filters of that kind are needed.
+    """
+    capture_filter: list[str] = ['ip', 'udp']
+
+    capture_filter.append(
+        f'((src host {capture_ip_address} and (not (dst net {_RESERVED_NETWORKS_FILTER}))) or (dst host {capture_ip_address} and (not (src net {_RESERVED_NETWORKS_FILTER}))))',
+    )
+
+    if broadcast_support and multicast_support:
+        capture_filter.append('not (broadcast or multicast)')
+    elif broadcast_support:
+        capture_filter.append('not broadcast')
+    elif multicast_support:
+        capture_filter.append('not multicast')
+
+    capture_filter.append('not (portrange 0-1023 or port 5353)')
+
+    # Protocols that need Python-level payload inspection (strategy B)
+    python_excluded_protocols: list[str] = []
+
+    if Settings.capture_filter_block_rtcp:
+        python_excluded_protocols.append('rtcp')
+    if Settings.capture_filter_block_dtls:
+        python_excluded_protocols.append('dtls')
+
+    blocked_tps_obj_ranges: list[tuple[IPv4Address, IPv4Address]] | None = None
+    if Settings.capture_block_third_party_servers:
+        blocked_tps_obj_ranges = ThirdPartyServers.get_ip_obj_ranges_for(Settings.capture_block_third_party_servers)
+
+    if Settings.capture_filter_block_ssdp:
+        capture_filter.append(f'not port {SSDPP_PORT}')
+    if Settings.capture_filter_block_raknet:
+        capture_filter.append(f'not port {RAKNET_PORT}')
+    if Settings.capture_filter_block_uaudp:
+        capture_filter.append(f'not port {UAUDP_PORT}')
+    if Settings.capture_filter_block_classicstun:
+        capture_filter.append(f'not port {CLASSICSTUN_PORT}')
+    if Settings.capture_filter_block_llmnr:
+        capture_filter.append(f'not port {LLMNR_PORT}')
+
+    if Settings.capture_blocked_ips:
+        blocked_bpf: list[str] = []
+        for raw in Settings.capture_blocked_ips:
+            if '/' in raw:
+                blocked_bpf.append(f'net {raw}')
+            elif '-' not in raw and '*' not in raw:
+                blocked_bpf.append(f'host {raw}')
+            # Start-end ranges and wildcards are handled at the software level only
+        if blocked_bpf:
+            capture_filter.append(f'not ({" or ".join(blocked_bpf)})')
+
+    if Settings.capture_prepend_custom_capture_filter:
+        capture_filter.insert(0, f'({Settings.capture_prepend_custom_capture_filter})')
+
+    capture_filter_str = ' and '.join(capture_filter) if capture_filter else None
+    display_filter_fn = _build_display_filter_fn(
+        python_excluded_protocols,
+        blocked_tps_obj_ranges=blocked_tps_obj_ranges,
+    )
+
+    return (capture_filter_str, display_filter_fn)

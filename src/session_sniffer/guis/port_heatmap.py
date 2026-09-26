@@ -1,0 +1,60 @@
+"""Port heatmap statistics window."""
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QTableWidget, QTableWidgetItem
+
+from session_sniffer.guis.table_context_menu import StatTableWindowMixin, skip_if_menu_open
+from session_sniffer.guis.utils import NumericTableWidgetItem, setup_stat_table
+from session_sniffer.player.registry import PlayersRegistry
+from session_sniffer.guis.i18n import install_translated_header
+
+
+class PortHeatmapWindow(StatTableWindowMixin):
+    """A standalone window ranking observed ports by frequency across all players."""
+
+    def __init__(self, *, always_on_top: bool = True) -> None:
+        """Initialize the port heatmap window."""
+        super().__init__()
+
+        self.setWindowTitle('Carte des ports')
+        self.resize(400, 420)
+        layout = self.setup_window_layout(always_on_top=always_on_top)
+
+        self._table = QTableWidget(0, 3)
+        install_translated_header(self._table)  # BTX: French column titles
+        self._table.setHorizontalHeaderLabels(['Port', 'Count', '% of Total'])
+        setup_stat_table(self._table, layout)
+        self.setup_stat_table_controls(layout, always_on_top=always_on_top)
+        self._reset_column_sizes()
+
+    @skip_if_menu_open
+    def refresh(self) -> None:
+        """Rebuild the table with current port frequency data."""
+        all_players = PlayersRegistry.get_all_players()
+        counts: dict[int, int] = {}
+        for player in all_players:
+            for port in player.ports.all:
+                counts[port] = counts.get(port, 0) + 1
+
+        total = sum(counts.values())
+        sorted_ports = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+
+        self._table.setSortingEnabled(False)
+        self._table.setRowCount(0)
+        for port, count in sorted_ports:
+            row = self._table.rowCount()
+            self._table.insertRow(row)
+            port_item = NumericTableWidgetItem(port)
+            port_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            count_item = NumericTableWidgetItem(count)
+            count_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            pct = f'{count / total * 100:.1f}%' if total else '0.0%'
+            pct_item = QTableWidgetItem(pct)
+            pct_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._table.setItem(row, 0, port_item)
+            self._table.setItem(row, 1, count_item)
+            self._table.setItem(row, 2, pct_item)
+        self._table.setSortingEnabled(True)
+        self._table.sortByColumn(1, Qt.SortOrder.DescendingOrder)
+        if self._custom_column_widths is None:
+            self._setup_column_resizing()

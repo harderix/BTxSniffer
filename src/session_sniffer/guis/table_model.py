@@ -1,0 +1,804 @@
+"""Session table model for connected and disconnected player tables."""
+
+import ipaddress
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from operator import attrgetter
+from typing import TYPE_CHECKING, override
+
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QModelIndex,
+    QPersistentModelIndex,
+    Qt,
+)
+from PySide6.QtGui import QColor, QBrush, QIcon, QPainter, QPixmap
+from PySide6.QtWidgets import (
+    QHeaderView,
+    QTableView,
+)
+
+from session_sniffer.constants.local import RESOURCES_DIR_PATH
+from session_sniffer.constants.standalone import (
+    BANDWIDTH_BASE_COLUMN_ATTRS,
+    BANDWIDTH_RATE_STAT_COLUMNS,
+    LOCATION_COLUMNS,
+    ORGANIZATION_COLUMNS,
+    PACKET_STAT_COLUMNS,
+    STATUS_COLUMNS,
+)
+from session_sniffer.error_messages import format_type_error
+from session_sniffer.guis.exceptions import TableDataConsistencyError, UnsupportedSortColumnError
+from session_sniffer.guis.high_rate_monitor import HighRateTracker
+from session_sniffer.guis.player_identifier import PlayerIdentifierTracker
+from session_sniffer.player.registry import PlayersRegistry, SessionHost
+from session_sniffer.settings import Settings
+from session_sniffer.guis.i18n import COLUMN_TOOLTIPS_FR
+from session_sniffer.guis.btx_notes import TAGS, PlayerNotes, tag_color
+
+MAX_POSSIBLE_IP_ICONS = 3
+
+
+def _create_composite_icon(icon_paths: tuple[str, ...]) -> QIcon:
+    """Combine SVG icons side-by-side into a single composite QIcon supporting standard and HiDPI."""
+    if not icon_paths:
+        return QIcon()
+    if len(icon_paths) == 1:
+        return QIcon(icon_paths[0])
+    count = len(icon_paths)
+    total_width = 16 * count + 2 * (count - 1)
+    loaded_icons = [QIcon(path) for path in icon_paths]
+    composite = QIcon()
+    for scale in (1, 2):
+        pixmap = QPixmap(total_width * scale, 16 * scale)
+        pixmap.setDevicePixelRatio(scale)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        try:
+            for i, icon in enumerate(loaded_icons):
+                icon.paint(painter, i * 18, 0, 16, 16)
+        finally:
+            painter.end()
+        composite.addPixmap(pixmap)
+    return composite
+
+
+if TYPE_CHECKING:
+    from session_sniffer.guis.tables import SessionTableView
+    from session_sniffer.rendering_core.types import CellColor
+
+GUI_COLUMN_HEADERS_TOOLTIPS = {
+    'Usernames': (
+        'Displays the usernames of players from your UserIP database files.\n\n'
+        'For GTA V PC users who have used the Session Sniffer mod menu plugin,\n'
+        'it automatically resolves usernames while the plugin is running,\n'
+        'or shows previously resolved players that were seen by the plugin.'
+    ),
+    'First Seen': 'The very first time the player was observed across all sessions.',
+    'Last Rejoin': 'The most recent time the player rejoined your session.',
+    'Last Seen': 'The most recent time the player was active in your session.',
+    'T. Session Time': 'The total amount of time the player has been playing across all sessions.',
+    'Session Time': 'The amount of time the player was playing in the last session before disconnecting.',
+    'Rejoins': 'The number of times the player has left and joined again your session across all sessions.',
+    'T. Packets': 'The total number of packets exchanged with the player across all sessions.',
+    'Packets': 'The number of packets exchanged (Received + Sent) with the player during the current session.',
+    'T. Packets Received': 'The total number of packets received from the player across all sessions.',
+    'Packets Received': 'The number of packets received from the player during the current session.',
+    'T. Packets Sent': 'The total number of packets sent to the player across all sessions.',
+    'Packets Sent': 'The number of packets sent to the player during the current session.',
+    'T. Min Packet Length': 'The minimum packet length (in bytes) exchanged with the player across all sessions.',
+    'Min Packet Length': 'The minimum packet length (in bytes) exchanged with the player during the current session.',
+    'T. Avg Packet Length': 'The average packet length (in bytes) exchanged with the player across all sessions.',
+    'Avg Packet Length': 'The average packet length (in bytes) exchanged with the player during the current session.',
+    'T. Max Packet Length': 'The maximum packet length (in bytes) exchanged with the player across all sessions.',
+    'Max Packet Length': 'The maximum packet length (in bytes) exchanged with the player during the current session.',
+    'PPS': 'The number of Packets exchanged (Received + Sent) with the player Per Second during the current session.',
+    'PPM': 'The number of Packets exchanged (Received + Sent) with the player Per Minute during the current session.',
+    'T. Bandwidth': 'The total amount of bytes transferred (Download + Upload) with the player across all sessions.',
+    'Bandwidth': 'The amount of bytes transferred (Download + Upload) with the player during the current session.',
+    'T. Download': 'The total amount of bytes downloaded from the player across all sessions.',
+    'Download': 'The amount of bytes downloaded from the player during the current session.',
+    'T. Upload': 'The total amount of bytes uploaded to the player across all sessions.',
+    'Upload': 'The amount of bytes uploaded to the player during the current session.',
+    'BPS': 'The number of Bytes transferred (Downloaded + Uploaded) with the player Per Second during the current session.',
+    'BPM': 'The number of Bytes transferred (Downloaded + Uploaded) with the player Per Minute during the current session.',
+    'IP Address': 'The IP address of the player.',
+    'Hostname': "The domain name associated with the player's IP address, resolved through a reverse DNS lookup.",
+    'Ports': 'All ports used by the player, ordered from first to last discovered (left to right).',
+    'Last Port': "The port used by the player's last captured packet.",
+    'Middle Ports': 'The ports used by the player between the first and last captured packets.',
+    'First Port': "The port used by the player's first captured packet.",
+    'Continent': "The continent of the player's IP location.",
+    'Country': "The country of the player's IP location.",
+    'Region': "The region of the player's IP location.",
+    'R. Code': "The region code of the player's IP location.",
+    'City': "The city associated with the player's IP location (typically representing the ISP or an intermediate location, not the player's home address city).",
+    'District': "The district of the player's IP location.",
+    'ZIP Code': "The ZIP/postal code of the player's IP location.",
+    'Lat': "The latitude of the player's IP location.",
+    'Lon': "The longitude of the player's IP location.",
+    'Time Zone': "The time zone of the player's IP location.",
+    'Offset': "The time zone offset of the player's IP location.",
+    'Currency': "The currency associated with the player's IP location.",
+    'Organization': "The organization associated with the player's IP address.",
+    'ISP': "The Internet Service Provider of the player's IP address.",
+    'ASN / ISP': 'The Autonomous System Number or Internet Service Provider of the player.',
+    'AS': "The Autonomous System code of the player's IP.",
+    'ASN': "The Autonomous System Number name associated with the player's IP.",
+    'Mobile': 'Indicates if the player is using a mobile network (e.g., through a cellular hotspot or mobile data).',
+    'VPN': 'Indicates if the player is using a VPN, Proxy, or Tor relay.',
+    'Hosting': 'Indicates if the player is using a hosting provider (similar to VPN).',
+    'Pinging': 'Indicates if the player is being actively pinged.',
+}
+
+_ZERO_TD = timedelta(0)
+
+
+@dataclass(frozen=True, slots=True)
+class _ColumnIndices:
+    """Immutable cache of frequently used column indices."""
+
+    ip: int
+    username: int
+    country: int | None
+    ports: int | None
+    pps: int | None
+
+
+def sort_table_rows(
+    rows_with_colors: list[tuple[list[str], list[CellColor]]],
+    column_name: str,
+    order: Qt.SortOrder,
+    headers: list[str],
+) -> list[tuple[list[str], list[CellColor]]]:
+    """Sort table rows and compiled colors by column name and sort order.
+
+    Args:
+        rows_with_colors: List of (row_cells, cell_colors) tuples.
+        column_name: Name of the header column to sort by.
+        order: Sort order (AscendingOrder or DescendingOrder).
+        headers: List of column header names.
+
+    Returns:
+        The sorted list of (row_cells, cell_colors) tuples.
+    """
+    if not rows_with_colors:
+        return rows_with_colors
+
+    resolved_column_name = column_name
+    if resolved_column_name not in headers:
+        if 'Last Rejoin' in headers:
+            resolved_column_name = 'Last Rejoin'
+        elif 'Last Seen' in headers:
+            resolved_column_name = 'Last Seen'
+        elif headers:
+            resolved_column_name = headers[0]
+        else:
+            return rows_with_colors
+
+    column_index = headers.index(resolved_column_name)
+    ip_column_index = headers.index('IP Address') if 'IP Address' in headers else -1
+
+    def _extract_ip(row_cells: list[str]) -> str:
+        if 0 <= ip_column_index < len(row_cells):
+            return row_cells[ip_column_index]
+        return ''
+
+    sort_order_bool = order == Qt.SortOrder.DescendingOrder
+    sorted_rows = list(rows_with_colors)
+
+    if resolved_column_name == 'Usernames':
+        sorted_rows.sort(
+            key=lambda row: row[0][column_index].casefold(),
+            reverse=sort_order_bool,
+        )
+    elif resolved_column_name in {'First Seen', 'Last Rejoin', 'Last Seen'}:
+        datetime_attr = {'First Seen': 'first_seen', 'Last Rejoin': 'last_rejoin', 'Last Seen': 'last_seen'}[resolved_column_name]
+        default_datetime = datetime.min.replace(tzinfo=UTC)
+        ip_datetime_map: dict[str, datetime] = {
+            _extract_ip(row): (
+                getattr(matched_player.datetime, datetime_attr) if (matched_player := PlayersRegistry.get_player_by_ip(_extract_ip(row))) is not None else default_datetime
+            )
+            for row, _ in sorted_rows
+        }
+        sorted_rows.sort(
+            key=lambda row: ip_datetime_map[_extract_ip(row[0])],
+            reverse=not sort_order_bool,
+        )
+    elif resolved_column_name == 'T. Session Time':
+        ip_total_session_time_map: dict[str, timedelta] = {
+            _extract_ip(row): (
+                matched_player.datetime.get_total_session_time() if (matched_player := PlayersRegistry.get_player_by_ip(_extract_ip(row))) is not None else _ZERO_TD
+            )
+            for row, _ in sorted_rows
+        }
+        sorted_rows.sort(
+            key=lambda row: ip_total_session_time_map[_extract_ip(row[0])],
+            reverse=sort_order_bool,
+        )
+    elif resolved_column_name == 'Session Time':
+        ip_session_time_map: dict[str, timedelta] = {
+            _extract_ip(row): (matched_player.datetime.get_session_time() if (matched_player := PlayersRegistry.get_player_by_ip(_extract_ip(row))) is not None else _ZERO_TD)
+            for row, _ in sorted_rows
+        }
+
+        def _session_time_sort_key(row: tuple[list[str], list[CellColor]]) -> tuple[timedelta, ipaddress.IPv4Address | ipaddress.IPv6Address | int]:
+            player_ip = _extract_ip(row[0])
+            session_duration = ip_session_time_map[player_ip]
+            try:
+                parsed_ip: ipaddress.IPv4Address | ipaddress.IPv6Address | int = ipaddress.ip_address(player_ip)
+            except ValueError:
+                parsed_ip = 0
+            return session_duration, parsed_ip
+
+        sorted_rows.sort(
+            key=_session_time_sort_key,
+            reverse=sort_order_bool,
+        )
+    elif resolved_column_name in {
+        'Rejoins',
+        *PACKET_STAT_COLUMNS,
+        'PPS',
+        'PPM',
+        'Last Port',
+        'First Port',
+    }:
+
+        def _stat_to_float(row: tuple[list[str], list[CellColor]]) -> float:
+            try:
+                return float(row[0][column_index])
+            except ValueError:
+                return float('-inf')
+
+        sorted_rows.sort(
+            key=_stat_to_float,
+            reverse=sort_order_bool,
+        )
+    elif resolved_column_name in BANDWIDTH_RATE_STAT_COLUMNS:
+        bandwidth_attr_map = {
+            **BANDWIDTH_BASE_COLUMN_ATTRS,
+            'BPS': 'bandwidth.bps.calculated_rate',
+            'BPM': 'bandwidth.bpm.calculated_rate',
+        }
+        bandwidth_attribute = bandwidth_attr_map[resolved_column_name]
+        ip_bandwidth_map: dict[str, int] = {
+            _extract_ip(row): (attrgetter(bandwidth_attribute)(matched_player) if (matched_player := PlayersRegistry.get_player_by_ip(_extract_ip(row))) is not None else 0)
+            for row, _ in sorted_rows
+        }
+        sorted_rows.sort(
+            key=lambda row: ip_bandwidth_map[_extract_ip(row[0])],
+            reverse=sort_order_bool,
+        )
+    elif resolved_column_name == 'Ports':
+        sorted_rows.sort(
+            key=lambda row: tuple(int(port) for port in row[0][column_index].split(', ') if port.isdigit()),
+            reverse=sort_order_bool,
+        )
+    elif resolved_column_name == 'Middle Ports':
+        sorted_rows.sort(
+            key=lambda row: len(row[0][column_index]),
+            reverse=sort_order_bool,
+        )
+    elif resolved_column_name in {'Lat', 'Lon', 'Offset'}:
+
+        def _geo_to_float(row: tuple[list[str], list[CellColor]]) -> float:
+            value = row[0][column_index]
+            if value == '...':
+                return float('-inf')
+            try:
+                return float(value)
+            except ValueError:
+                return float('-inf')
+
+        sorted_rows.sort(
+            key=_geo_to_float,
+            reverse=sort_order_bool,
+        )
+    elif resolved_column_name == 'IP Address':
+
+        def _to_ip_address(row: tuple[list[str], list[CellColor]]) -> ipaddress.IPv4Address | ipaddress.IPv6Address | int:
+            try:
+                return ipaddress.ip_address(_extract_ip(row[0]))
+            except ValueError:
+                return 0
+
+        sorted_rows.sort(
+            key=_to_ip_address,
+            reverse=sort_order_bool,
+        )
+    elif resolved_column_name in {
+        'Hostname',
+        *LOCATION_COLUMNS,
+        *ORGANIZATION_COLUMNS,
+        *STATUS_COLUMNS,
+    }:
+        sorted_rows.sort(
+            key=lambda row: row[0][column_index].casefold(),
+            reverse=sort_order_bool,
+        )
+    else:
+        raise UnsupportedSortColumnError(resolved_column_name)
+
+    return sorted_rows
+
+
+class SessionTableModel(QAbstractTableModel):  # pylint: disable=too-many-public-methods
+    """Provide a Qt table model for rendering connected/disconnected sessions."""
+
+    TABLE_CELL_TOOLTIP_MARGIN = 8  # Margin in pixels for determining when to show tooltips for truncated text
+
+    def __init__(self, headers: list[str]) -> None:
+        """Initialize the table model with a set of column headers.
+
+        Args:
+            headers: Column header labels for the table.
+        """
+        super().__init__()
+
+        self._view: SessionTableView | None = None  # Initially, no view is attached
+        self._data: list[list[str]] = []  # The data to be displayed in the table
+        self._compiled_colors: list[list[CellColor]] = []  # The compiled colors for the table
+        self._headers = headers  # The column headers
+        self._column_indices = _ColumnIndices(
+            ip=self._headers.index('IP Address'),
+            username=self._headers.index('Usernames'),
+            country=self.get_column_index('Country'),
+            ports=self.get_column_index('Ports'),
+            pps=self.get_column_index('PPS'),
+        )
+        self._ip_to_row_index: dict[str, int] = {}  # O(1) row lookup by IP
+        self._ip_icons_cache: dict[tuple[str, ...], QIcon] = {}
+
+    # --------------------------------------------------------------------------
+    # Public properties
+    # --------------------------------------------------------------------------
+
+    @property
+    def view(self) -> SessionTableView:
+        """Get or attach a `SessionTableView` to this model."""
+        if self._view is None:
+            raise TypeError(format_type_error(self._view, QTableView))
+        return self._view
+
+    @view.setter
+    def view(self, new_view: SessionTableView) -> None:
+        """Attach a `SessionTableView` to this model."""
+        self._view = new_view
+
+    # --------------------------------------------------------------------------
+    # Public read-only properties
+    # --------------------------------------------------------------------------
+
+    @property
+    def column_names(self) -> list[str]:
+        """Return the current column header names."""
+        return self._headers
+
+    @property
+    def ip_column_index(self) -> int:
+        """Returns the index of the 'IP Address' column in this table model.
+
+        This value is computed during initialization based on the `headers` provided.<br>
+        It is read-only and specific to this instance.
+        """
+        return self._column_indices.ip
+
+    @property
+    def username_column_index(self) -> int:
+        """Returns the index of the 'Usernames' column in this table model.
+
+        This value is computed during initialization based on the `headers` provided.<br>
+        It is read-only and specific to this instance.
+        """
+        return self._column_indices.username
+
+    @property
+    def ports_column_index(self) -> int | None:
+        """Returns the index of the 'Ports' column in this table model, or None if not present.
+
+        This value is computed during initialization based on the `headers` provided.<br>
+        It is read-only and specific to this instance.
+        """
+        return self._column_indices.ports
+
+    # --------------------------------------------------------------------------
+    # Qt model methods (overrides)
+    # --------------------------------------------------------------------------
+
+    @override
+    def rowCount(self, parent: QModelIndex | QPersistentModelIndex | None = None) -> int:
+        """Return number of rows in the model."""
+        if parent is None:
+            parent = QModelIndex()
+        return len(self._data)
+
+    @override
+    def columnCount(self, parent: QModelIndex | QPersistentModelIndex | None = None) -> int:
+        """Return number of columns in the model."""
+        if parent is None:
+            parent = QModelIndex()
+        return len(self._headers)
+
+    @override
+    def data(self, index: QModelIndex | QPersistentModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> str | QBrush | QIcon | None:
+        """Override data method to customize data retrieval and alignment."""
+        if not index.isValid():
+            return None
+
+        row_index = index.row()
+        column_index = index.column()
+
+        # Check bounds
+        if row_index >= len(self._data) or column_index >= len(self._data[row_index]):
+            return None  # Return None for invalid index
+
+        output: str | QBrush | QIcon | None = None
+
+        if role == Qt.ItemDataRole.DecorationRole:
+            if self._column_indices.country is not None and self._column_indices.country == column_index:
+                ip = self.get_ip_from_data_safely(self._data[row_index])
+
+                matched_player = PlayersRegistry.get_player_by_ip(ip)
+                if matched_player is not None and matched_player.country_flag is not None:
+                    output = matched_player.country_flag.icon
+            elif self.ip_column_index >= 0 and self.ip_column_index == column_index:
+                ip = self.get_ip_from_data_safely(self._data[row_index])
+                icon_paths: list[str] = []
+                if Settings.gui_session_host_icon and SessionHost.is_host(ip):
+                    icon_paths.append(str(RESOURCES_DIR_PATH / 'icons' / 'crown.svg'))
+                if Settings.high_rate_monitor_icon and HighRateTracker.is_high_rate(ip):
+                    icon_paths.append(str(RESOURCES_DIR_PATH / 'icons' / 'speedometer.svg'))
+                if Settings.player_identifier_icon and PlayerIdentifierTracker.is_identified(ip):
+                    icon_paths.append(str(RESOURCES_DIR_PATH / 'icons' / 'target.svg'))
+                if ip and PlayerNotes.get(ip):
+                    icon_paths.append(str(RESOURCES_DIR_PATH / 'icons' / 'edit.svg'))  # BTX: player has a note
+                if icon_paths:
+                    cache_key = tuple(icon_paths)
+                    if cache_key not in self._ip_icons_cache:
+                        self._ip_icons_cache[cache_key] = _create_composite_icon(cache_key)
+                    output = self._ip_icons_cache[cache_key]
+        elif role == Qt.ItemDataRole.DisplayRole:
+            # Return the cell's text
+            output = self._data[row_index][column_index]
+        elif role == Qt.ItemDataRole.ForegroundRole and row_index < len(self._compiled_colors) and column_index < len(self._compiled_colors[row_index]):
+            # Return the cell's foreground color (BTX: tagged players get their tag colour on the username/IP cells)
+            output = QBrush(self._compiled_colors[row_index][column_index].foreground)
+            if column_index in (self.username_column_index, self.ip_column_index):
+                tagged_color = tag_color(self.get_ip_from_data_safely(self._data[row_index]) or '')
+                if tagged_color:
+                    output = QBrush(QColor(tagged_color))
+        elif role == Qt.ItemDataRole.BackgroundRole and row_index < len(self._compiled_colors) and column_index < len(self._compiled_colors[row_index]):
+            # Return the cell's background color
+            bg_color = self._compiled_colors[row_index][column_index].background
+            if bg_color is not None:
+                output = QBrush(bg_color)
+        elif role == Qt.ItemDataRole.ToolTipRole:
+            # Return the tooltip text for the cell
+            horizontal_header = self.view.horizontalHeader()
+            resize_mode = horizontal_header.sectionResizeMode(index.column())
+
+            # Return None if the column resize mode isn't set to Stretch, as it shouldn't be truncated
+            if resize_mode == QHeaderView.ResizeMode.Stretch:
+                cell_text = self._data[row_index][column_index]
+
+                font_metrics = self.view.fontMetrics()
+                text_width = font_metrics.horizontalAdvance(cell_text)
+                column_width = self.view.columnWidth(index.column())
+
+                if text_width > column_width - self.TABLE_CELL_TOOLTIP_MARGIN:
+                    output = cell_text
+
+            if self.ip_column_index >= 0 and self.ip_column_index == column_index:
+                ip = self.get_ip_from_data_safely(self._data[row_index])
+                tooltips: list[str] = []
+                if output:
+                    tooltips.append(str(output))
+                if Settings.gui_session_host_icon and SessionHost.is_host(ip):
+                    tooltips.append('Hôte de session')
+                if Settings.high_rate_monitor_icon and HighRateTracker.is_high_rate(ip):
+                    tooltips.append('Trafic élevé détecté (dépasse les seuils PPS/BPS)')
+                if Settings.player_identifier_icon and PlayerIdentifierTracker.is_identified(ip):
+                    tooltips.append('Joueur identifié (Trouveur de joueur)')
+                tag = PlayerNotes.get_tag(ip) if ip else ''
+                if tag:
+                    tooltips.append(f'Étiquette : {TAGS[tag][0]}')
+                note = PlayerNotes.get(ip) if ip else ''
+                if note:
+                    tooltips.append(f'📝 Note : {note}')
+                if tooltips:
+                    output = '\n'.join(tooltips)
+            elif self.username_column_index >= 0 and self.username_column_index == column_index:
+                ip = self.get_ip_from_data_safely(self._data[row_index])
+                extra = []
+                tag = PlayerNotes.get_tag(ip) if ip else ''
+                if tag:
+                    extra.append(f'Étiquette : {TAGS[tag][0]}')
+                note = PlayerNotes.get(ip) if ip else ''
+                if note:
+                    extra.append(f'📝 Note : {note}')
+                if extra:
+                    output = '\n'.join([str(output), '', *extra]) if output else '\n'.join(extra)
+
+        return output
+
+    @override
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole) -> str | None:
+        """Return header display text and tooltips for the table model."""
+        if orientation == Qt.Orientation.Horizontal:
+            if role == Qt.ItemDataRole.DisplayRole:
+                return self._headers[section]  # Display the header name
+            if role == Qt.ItemDataRole.ToolTipRole:
+                # Fetch the header name and return the corresponding tooltip
+                header_name = self._headers[section]
+                return COLUMN_TOOLTIPS_FR.get(header_name) or GUI_COLUMN_HEADERS_TOOLTIPS.get(header_name)
+
+        return None
+
+    @override
+    def flags(self, index: QModelIndex | QPersistentModelIndex) -> Qt.ItemFlag:
+        """Return Qt flags controlling whether the item is enabled/selectable."""
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+
+        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+
+    @override
+    def sort(self, column: int, order: Qt.SortOrder = Qt.SortOrder.AscendingOrder) -> None:
+        """Sort the table by a specific column.
+
+        Args:
+            column: The column index to sort by.
+            order: The order (ascending/descending) to sort in.
+        """
+        if not self._data:
+            if self._compiled_colors:
+                raise TableDataConsistencyError(case='colors_without_data')
+            return  # No data to process, exit early.
+
+        if not self._compiled_colors:
+            raise TableDataConsistencyError(case='data_without_colors')
+
+        self.layoutAboutToBeChanged.emit()
+
+        sorted_column_name = self._headers[column]
+
+        # Combine data and colors for sorting
+        combined = list(zip(self._data, self._compiled_colors, strict=True))
+        if not combined:
+            raise TableDataConsistencyError(case='empty_combined')
+        sorted_rows = sort_table_rows(
+            rows_with_colors=combined,
+            column_name=sorted_column_name,
+            order=order,
+            headers=self._headers,
+        )
+
+        # Unpack the sorted data
+        self._data, self._compiled_colors = map(list, zip(*sorted_rows, strict=True))
+        self._rebuild_ip_index()
+
+        self.layoutChanged.emit()
+
+    # --------------------------------------------------------------------------
+    # Custom / internal management methods
+    # --------------------------------------------------------------------------
+
+    def _rebuild_ip_index(self) -> None:
+        """Rebuild the IP-to-row-index cache from current data."""
+        self._ip_to_row_index = {self.get_ip_from_data_safely(row): i for i, row in enumerate(self._data)}
+
+    def get_column_index(self, column_name: str, /) -> int | None:
+        """Get the table index of a specified column, or None if not present.
+
+        Args:
+            column_name: The column name to look for.
+
+        Returns:
+            The column index, or None if the column is not visible.
+        """
+        try:
+            return self._headers.index(column_name)
+        except ValueError:
+            return None
+
+    def get_row_index_by_ip(self, ip: str, /) -> int | None:
+        """Find the row index for the given IP address.
+
+        Args:
+            ip: The IP address to search for.
+
+        Returns:
+            The index of the row containing the IP address, or None if not found.
+        """
+        return self._ip_to_row_index.get(ip)
+
+    def get_ip_for_row(self, row: int, /) -> str:
+        """Return the IP address for the given row index.
+
+        Args:
+            row: The row index.
+
+        Returns:
+            The IP address string for the row.
+
+        Raises:
+            IndexError: If the row index is out of bounds.
+        """
+        return self.get_ip_from_data_safely(self._data[row])
+
+    def get_all_ips(self) -> list[str]:
+        """Return the IP address for every row currently in the model."""
+        return [self.get_ip_from_data_safely(row_data) for row_data in self._data]
+
+    def get_ip_from_data_safely(self, row_data: list[str]) -> str:
+        """Safely extract an IP address as a string from row data.
+
+        This method ensures the IP address is always returned as a string type.
+
+        Args:
+            row_data: The row data list containing the IP address.
+
+        Returns:
+            The IP address as a clean string (with crown suffix removed if present).
+
+        Raises:
+            IndexError: If the IP column index is out of bounds.
+            TypeError: If the IP data is not a string.
+        """
+        if self.ip_column_index >= len(row_data):
+            message = f'IP column index {self.ip_column_index} is out of bounds for row data with {len(row_data)} columns'
+            raise IndexError(message)
+
+        return row_data[self.ip_column_index]
+
+    def get_display_text(self, index: QModelIndex) -> str | None:
+        """Extract display text as a string from model data.
+
+        This method handles the case where model data might return `str`, `QBrush`, `QIcon` or `None` for decoration roles, but we only want the display text as a string.
+
+        Args:
+            index: The QModelIndex to get display text from.
+
+        Returns:
+            The display text as a string, or `None` if no valid display text is available.
+
+        Raises:
+            TypeError: If the display data is not a string and is not `None`.
+        """
+        # Explicitly request DisplayRole to get only the text content
+        display_data = self.data(index, Qt.ItemDataRole.DisplayRole)
+        if display_data is None:
+            return None
+        if not isinstance(display_data, str):
+            raise TypeError(format_type_error(display_data, str))
+
+        return display_data
+
+    def max_ip_icons(self) -> int:
+        """Return the maximum number of icons displayed in the IP Address column for any row."""
+        ip_column = self.ip_column_index
+        if ip_column < 0:
+            return 0
+        max_count = 0
+        for row_data in self._data:
+            if len(row_data) <= ip_column:
+                continue
+            ip = row_data[ip_column]
+            count = 0
+            if Settings.gui_session_host_icon and SessionHost.is_host(ip):
+                count += 1
+            if Settings.high_rate_monitor_icon and HighRateTracker.is_high_rate(ip):
+                count += 1
+            if Settings.player_identifier_icon and PlayerIdentifierTracker.is_identified(ip):
+                count += 1
+            if count > max_count:
+                max_count = count
+                if max_count == MAX_POSSIBLE_IP_ICONS:
+                    break
+        return max_count
+
+    def has_multiple_ports(self) -> bool:
+        """Return whether any row in the table contains multiple ports."""
+        ports_column = self.ports_column_index
+        if ports_column is None or ports_column < 0:
+            return False
+        return any(len(row_data) > ports_column and ',' in row_data[ports_column] for row_data in self._data)
+
+    def add_row_without_refresh(self, row_data: list[str], row_colors: list[CellColor]) -> None:
+        """Add a new row to the model without notifying the view in real time.
+
+        Args:
+            row_data: The data for the new row.
+            row_colors: A list of `CellColor` objects corresponding to the row's colors.
+        """
+        # Only update internal data without triggering signals
+        row_index = len(self._data)
+        self._data.append(row_data)
+        self._compiled_colors.append(row_colors)
+        ip = self.get_ip_from_data_safely(row_data)
+        self._ip_to_row_index[ip] = row_index
+
+    def update_row_without_refresh(self, row_index: int, row_data: list[str], row_colors: list[CellColor]) -> None:
+        """Update an existing row in the model with new data and colors without notifying the view in real time.
+
+        Args:
+            row_index: The index of the row to update.
+            row_data: The new data for the row.
+            row_colors: A list of `CellColor` objects corresponding to the row's colors.
+        """
+        if 0 <= row_index < self.rowCount():
+            # Remove old IP mapping before updating
+            old_ip = self.get_ip_from_data_safely(self._data[row_index])
+            self._ip_to_row_index.pop(old_ip, None)
+            self._data[row_index] = row_data
+            self._compiled_colors[row_index] = row_colors
+            new_ip = self.get_ip_from_data_safely(row_data)
+            self._ip_to_row_index[new_ip] = row_index
+
+    def delete_row(self, row_index: int) -> None:
+        """Delete a row from the model along with its associated colors.
+
+        Args:
+            row_index: The index of the row to delete.
+        """
+        if 0 <= row_index < self.rowCount():
+            # Notify the view that rows are about to be removed
+            self.beginRemoveRows(QModelIndex(), row_index, row_index)
+
+            # Remove the data and compiled colors at the specified index
+            self._data.pop(row_index)
+            if row_index < len(self._compiled_colors):
+                self._compiled_colors.pop(row_index)
+            self._rebuild_ip_index()
+
+            # Notify the view that the rows have been removed
+            self.endRemoveRows()
+
+            # NOTE: Fixes a weird UI bug that when someone leaves, it makes it an empty row
+            if not self._data:
+                # Begin resetting the model to indicate it's empty
+                self.beginResetModel()
+                self._data = []
+                self._compiled_colors = []
+                self._ip_to_row_index.clear()
+                # End reset and notify the view that the model has been reset
+                self.endResetModel()
+
+    def reset_columns(self, headers: list[str] | None = None) -> None:
+        """Replace column headers and clear all data.
+
+        When *headers* is `None` the current headers are kept and only the
+        row data is cleared (equivalent to the old `clear_all_data`).
+
+        Args:
+            headers: New column header labels, or `None` to keep the current ones.
+        """
+        self.beginResetModel()
+        if headers is not None:
+            self._headers = headers
+            self._column_indices = _ColumnIndices(
+                ip=self._headers.index('IP Address'),
+                username=self._headers.index('Usernames'),
+                country=self.get_column_index('Country'),
+                ports=self.get_column_index('Ports'),
+                pps=self.get_column_index('PPS'),
+            )
+        self._data = []
+        self._compiled_colors = []
+        self._ip_to_row_index.clear()
+        self.endResetModel()
+
+    def remove_player_by_ip(self, ip: str) -> None:
+        """Remove a single player row from the table by IP address.
+
+        Args:
+            ip: The IP address of the player to remove.
+        """
+        row_index = self._ip_to_row_index.get(ip)
+        if row_index is not None:
+            self.delete_row(row_index)
+
+    def refresh_view(self) -> None:
+        """Notifies the view to refresh and reflect all changes made to the model."""
+        self.layoutAboutToBeChanged.emit()
+        self.layoutChanged.emit()

@@ -1,0 +1,984 @@
+"""Widget factory helpers shared by `SettingsDialog`."""
+
+import re
+from typing import TYPE_CHECKING, cast, override
+
+from PySide6.QtCore import QRegularExpression, QSize, Qt
+from PySide6.QtGui import QAction, QIcon, QRegularExpressionValidator
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDoubleSpinBox,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QPushButton,
+    QSizePolicy,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+
+from session_sniffer.constants.local import RESOURCES_DIR_PATH
+from session_sniffer.constants.standalone import DISCORD_INVITE_URL
+from session_sniffer.guis.color_picker_dialog import ColorPickerButton
+from session_sniffer.guis.secret_line_edit import SecretLineEdit
+from session_sniffer.guis.stylesheets import (
+    COMPACT_BUTTON_STYLESHEET,
+    COMPACT_DANGER_BUTTON_STYLESHEET,
+    DISCORD_INFO_LABEL_STYLESHEET,
+    WEBSERVER_HELP_LABEL_STYLESHEET,
+)
+from session_sniffer.guis.userip_manager_helpers import IPRangeBuilderDialog
+from session_sniffer.guis.utils import ElidedTextTooltipDelegate
+from session_sniffer.settings import SETTING_DEFAULTS, SettingMeta, SettingType
+from session_sniffer.settings.settings import Settings
+from session_sniffer.guis.i18n import TrComboBox
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+def format_setting_tooltip(meta: SettingMeta) -> str | None:
+    """Return the tooltip text for *meta*, consistently including the capture restart note if required."""
+    if not meta.tooltip:
+        return 'Redémarrage de la capture nécessaire' if meta.requires_capture_restart else None
+    if meta.requires_capture_restart and '(requires capture restart)' not in meta.tooltip:
+        return f'{meta.tooltip} (redémarrage de la capture nécessaire)'
+    return meta.tooltip
+
+
+def create_standard_form_layout(parent: QWidget | None = None) -> QFormLayout:
+    """Create and configure a standard `QFormLayout` for settings pages and groups."""
+    layout = QFormLayout(parent) if parent else QFormLayout()
+    layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+    layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    return layout
+
+
+def create_standard_vbox_layout(parent: QWidget | None = None) -> QVBoxLayout:
+    """Create and configure a standard `QVBoxLayout` with uniform group spacing."""
+    layout = QVBoxLayout(parent) if parent else QVBoxLayout()
+    layout.setSpacing(16)
+    return layout
+
+
+def create_setting_label(meta: SettingMeta) -> QLabel:
+    """Create a standard form label for a setting with an optional tooltip."""
+    label = QLabel(f'{meta.display_label}:')
+    tooltip = format_setting_tooltip(meta)
+    if tooltip:
+        label.setToolTip(tooltip)
+    return label
+
+
+def create_boolean_widget(meta: SettingMeta) -> QCheckBox:
+    """Create a checkbox widget for a boolean setting."""
+    checkbox = QCheckBox()
+    tooltip = format_setting_tooltip(meta)
+    if tooltip:
+        checkbox.setToolTip(tooltip)
+    return checkbox
+
+
+def create_color_widget(meta: SettingMeta) -> ColorPickerButton:
+    """Create a color picker button widget for a color setting."""
+    button = ColorPickerButton()
+    tooltip = format_setting_tooltip(meta)
+    if tooltip:
+        button.setToolTip(tooltip)
+    return button
+
+
+def create_text_widget(meta: SettingMeta) -> QLineEdit:
+    """Create a line-edit widget for a string/IPv4/MAC setting.
+
+    For secret fields (`meta.secret=True`) a reveal toggle action is embedded
+    as a trailing icon inside the `QLineEdit` itself.
+    """
+    le = SecretLineEdit() if meta.secret else QLineEdit()
+    if meta.setting_type == SettingType.IPV4:
+        le.setPlaceholderText('e.g. 192.168.1.100')
+        le.setMaxLength(15)
+        le.setValidator(QRegularExpressionValidator(QRegularExpression(r'[0-9.]{0,15}')))
+    elif meta.setting_type == SettingType.MAC_ADDRESS:
+        le.setPlaceholderText('ex. AA:BB:CC:DD:EE:FF')
+        le.setMaxLength(17)
+        le.setValidator(QRegularExpressionValidator(QRegularExpression(r'[0-9A-Fa-f:]{0,17}')))
+
+        def _auto_format_mac(text: str, widget: QLineEdit = le) -> None:
+            cursor = widget.cursorPosition()
+            hex_before = sum(1 for char in text[:cursor] if char in '0123456789ABCDEFabcdef')
+            hex_only = ''.join(char for char in text.upper() if char in '0123456789ABCDEF')[:12]
+            formatted = ':'.join(hex_only[i : i + 2] for i in range(0, len(hex_only), 2))
+            if formatted == text:
+                return
+            widget.blockSignals(True)  # noqa: FBT003
+            widget.setText(formatted)
+            widget.blockSignals(False)  # noqa: FBT003
+            new_pos = len(formatted)
+            hex_count = 0
+            for i, char in enumerate(formatted):
+                if hex_count == hex_before:
+                    new_pos = i
+                    break
+                if char != ':':
+                    hex_count += 1
+            widget.setCursorPosition(new_pos)
+
+        le.textEdited.connect(_auto_format_mac)
+    if meta.max_length is not None:
+        le.setMaxLength(meta.max_length)
+    if meta.validator_pattern is not None:
+        _char_rx = re.compile(meta.validator_pattern)
+
+        def _filter_chars(text: str, _le: QLineEdit = le, _rx: re.Pattern[str] = _char_rx) -> None:
+            filtered = ''.join(_rx.findall(text))
+            if filtered == text:
+                return
+            _le.blockSignals(True)  # noqa: FBT003
+            _le.setText(filtered)
+            _le.blockSignals(False)  # noqa: FBT003
+
+        le.textEdited.connect(_filter_chars)
+    tooltip = format_setting_tooltip(meta)
+    if tooltip:
+        le.setToolTip(tooltip)
+    if meta.min_width is not None:
+        le.setMinimumWidth(meta.min_width)
+    if meta.max_width is not None:
+        le.setMaximumWidth(meta.max_width)
+    if meta.secret:
+        _icons_dir = RESOURCES_DIR_PATH / 'icons'
+        icon_show = QIcon(str(_icons_dir / 'eye_show.svg'))
+        icon_hide = QIcon(str(_icons_dir / 'eye_hide.svg'))
+        reveal_action = le.addAction(icon_hide, QLineEdit.ActionPosition.TrailingPosition)
+        if not reveal_action:
+            message = 'QLineEdit.addAction returned None'
+            raise RuntimeError(message)
+        _act: QAction = reveal_action
+        _act.setCheckable(True)
+        _act.setToolTip('Afficher')
+
+        def _toggle_echo(checked: bool, _le: QLineEdit = le, _show: QIcon = icon_show, _hide: QIcon = icon_hide, _a: QAction = _act) -> None:  # noqa: FBT001
+            if isinstance(_le, SecretLineEdit):
+                _le.set_revealed(revealed=checked)
+            else:
+                _le.setEchoMode(QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password)
+            _a.setIcon(_show if checked else _hide)
+            _a.setToolTip('Masquer' if checked else 'Afficher')
+
+        _act.toggled.connect(_toggle_echo)
+        le.setProperty('secret_action', _act)
+    return le
+
+
+def create_float_widget(meta: SettingMeta) -> QDoubleSpinBox:
+    """Create a double spin-box widget for a float setting."""
+    spin = QDoubleSpinBox()
+    spin.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    spin.setDecimals(1)
+    spin.setSingleStep(0.5)
+    spin.setMinimum(meta.min_value if meta.min_value is not None else 0.0)
+    spin.setMaximum(meta.max_value if meta.max_value is not None else 99999.0)
+    tooltip = format_setting_tooltip(meta)
+    if tooltip:
+        spin.setToolTip(tooltip)
+    return spin
+
+
+def create_integer_widget(meta: SettingMeta) -> QSpinBox:
+    """Create a spin-box widget for an integer setting."""
+    spin = QSpinBox()
+    spin.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    spin.setSingleStep(int(meta.step) if meta.step is not None else 1)
+    spin.setMinimum(int(meta.min_value) if meta.min_value is not None else 0)
+    spin.setMaximum(int(meta.max_value) if meta.max_value is not None else 99999)
+    tooltip = format_setting_tooltip(meta)
+    if tooltip:
+        spin.setToolTip(tooltip)
+    return spin
+
+
+def create_integer_or_all_widget(meta: SettingMeta) -> QSpinBox:
+    """Create a spin-box widget for an integer-or-all setting (0 displays as special text)."""
+    spin = QSpinBox()
+    spin.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    spin.setSingleStep(int(meta.step) if meta.step is not None else 1)
+    spin.setMinimum(0)
+    spin.setMaximum(int(meta.max_value) if meta.max_value is not None else 99999)
+    spin.setSpecialValueText(meta.special_value_text)
+    tooltip = format_setting_tooltip(meta)
+    if tooltip:
+        spin.setToolTip(tooltip)
+    return spin
+
+
+def create_enum_widget(meta: SettingMeta) -> QComboBox:
+    """Create a combo-box widget for an enum setting."""
+    combo = TrComboBox()
+    combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    if meta.allowed_values:
+        combo.addItems(meta.allowed_values)
+    elif meta.allowed_columns_attr:
+        if meta.allowed_columns_attr == 'GUI_ALL_CONNECTED_COLUMNS':
+            combo.addItems([col for col in Settings.GUI_ALL_CONNECTED_COLUMNS if col in set(Settings.gui_columns_connected_shown) or col in Settings.GUI_FORCED_COLUMNS])
+        elif meta.allowed_columns_attr == 'GUI_ALL_DISCONNECTED_COLUMNS':
+            combo.addItems([col for col in Settings.GUI_ALL_DISCONNECTED_COLUMNS if col in set(Settings.gui_columns_disconnected_shown) or col in Settings.GUI_FORCED_COLUMNS])
+        else:
+            combo.addItems(cast('tuple[str, ...]', getattr(Settings, meta.allowed_columns_attr, ())))
+    tooltip = format_setting_tooltip(meta)
+    if tooltip:
+        combo.setToolTip(tooltip)
+    return combo
+
+
+def create_bool_or_enum_widget(meta: SettingMeta) -> QComboBox:
+    """Create a combo-box widget for a bool-or-enum setting (first item is 'Disabled')."""
+    combo = TrComboBox()
+    items = ['Disabled']
+    if meta.allowed_values:
+        items.extend(meta.allowed_values)
+    combo.addItems(items)
+    tooltip = format_setting_tooltip(meta)
+    if tooltip:
+        combo.setToolTip(tooltip)
+    return combo
+
+
+def create_column_tuple_widget(key: str, meta: SettingMeta) -> QGroupBox:
+    """Create a multi-column grid of checkboxes for column visibility."""
+    allowed_attr = meta.allowed_columns_attr or ''
+    allowed_columns = cast('tuple[str, ...]', getattr(Settings, allowed_attr, ()))
+    default_columns = cast('tuple[str, ...]', SETTING_DEFAULTS.get(key, ()))
+
+    group = QGroupBox(meta.display_label.replace('&', '&&'))
+    tooltip = format_setting_tooltip(meta)
+    if tooltip:
+        group.setToolTip(tooltip)
+
+    inner = QWidget()
+    grid = QGridLayout(inner)
+    grid.setContentsMargins(4, 4, 4, 4)
+    grid.setSpacing(2)
+
+    column_count = 3
+    for i, column_name in enumerate(allowed_columns):
+        display_text = meta.display_labels.get(column_name, column_name) if meta.display_labels else column_name
+        checkbox = QCheckBox(display_text)
+        checkbox.setObjectName(column_name)
+        grid.addWidget(checkbox, i // column_count, i % column_count)
+    grid.setRowStretch(grid.rowCount(), 1)
+
+    button_select_all = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'select_all.svg')), ' Tout sélectionner')
+    button_deselect_all = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'unselect_all.svg')), ' Tout désélectionner')
+    button_reset = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'reset_default.svg')), ' Par défaut')
+    button_reset.setToolTip('Revenir aux colonnes par défaut')
+    for button in (button_select_all, button_deselect_all):
+        button.setStyleSheet(COMPACT_BUTTON_STYLESHEET)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+    button_reset.setStyleSheet(COMPACT_DANGER_BUTTON_STYLESHEET)
+    button_reset.setCursor(Qt.CursorShape.PointingHandCursor)
+    button_reset.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+    button_select_all.clicked.connect(lambda: set_all_checkboxes(inner, checked=True))
+    button_deselect_all.clicked.connect(lambda: set_all_checkboxes(inner, checked=False))
+    button_reset.clicked.connect(lambda: set_checkboxes_to(inner, default_columns))
+
+    button_row = QHBoxLayout()
+    button_row.setContentsMargins(0, 0, 0, 0)
+    button_row.setSpacing(6)
+    button_row.addWidget(button_select_all)
+    button_row.addWidget(button_deselect_all)
+    button_row.addStretch()
+    button_row.addWidget(button_reset)
+
+    outer = QVBoxLayout(group)
+    outer.setSpacing(4)
+    outer.addLayout(button_row)
+    outer.addWidget(inner)
+    return group
+
+
+def create_third_party_servers_split_widget(key: str, meta: SettingMeta) -> QWidget:
+    """Create a widget with checkable presets and a single list of server checkboxes."""
+    allowed_attr = meta.allowed_columns_attr or ''
+    allowed_columns = cast('tuple[str, ...]', getattr(Settings, allowed_attr, ()))
+    default_columns = cast('tuple[str, ...]', SETTING_DEFAULTS.get(key, ()))
+    display_labels = meta.display_labels or {}
+
+    container = QWidget()
+    layout = QVBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(10)
+
+    # Presets group box
+    presets_group = QGroupBox('Préréglages apps && jeux')
+    presets_group.setToolTip("Choisis des préréglages pour bloquer automatiquement leurs plages d'IP. Tu peux en cocher plusieurs.")
+    presets_grid_container = QWidget()
+    presets_grid = QGridLayout(presets_grid_container)
+    presets_grid.setContentsMargins(4, 4, 4, 4)
+    presets_grid.setSpacing(2)
+
+    preset_names = [
+        'Azar',
+        'Borderlands 2',
+        'Borderlands 3',
+        'Borderlands 4',
+        'Borderlands: The Pre-Sequel',
+        'Call of Duty®: Advanced Warfare',
+        'Call of Duty®: Black Ops',
+        'Call of Duty®: Black Ops Cold War',
+        'Call of Duty®: Black Ops II',
+        'Call of Duty®: Black Ops III',
+        'Call of Duty®: Ghosts',
+        'Call of Duty®: Infinite Warfare',
+        'Call of Duty®: Modern Warfare® 2 (2009)',
+        'Call of Duty®: Modern Warfare® 3 (2011)',
+        'Call of Duty®: Vanguard',
+        'Call of Duty®: WWII',
+        'Chatspin',
+        'Deep Rock Galactic',
+        'Discord',
+        'Dying Light',
+        'Dying Light 2',
+        'Grand Theft Auto Online',
+        "John Carpenter's Toxic Commando",
+        'Minecraft Bedrock Edition',
+        'Monopoly Madness',
+        'Mortal Kombat 11',
+        'Mortal Kombat X',
+        'Need for Speed™ Most Wanted',
+        'NEW MONOPOLY®',
+        'OmeTV',
+        'Payday 2',
+        'PlayStation Party Chat',
+        'Ready or Not',
+        'Red Dead Online',
+        'Risk of Rain 2',
+        'RustDesk',
+        'Sniper Elite 3',
+        'Steam',
+        'The Division 2',
+        'theHunter Call of the Wild™',
+        'theHunter Classic',
+        "Tom Clancy's Ghost Recon® Breakpoint",
+        'UNO',
+        'Warframe',
+        'Watch Dogs® 2',
+        'Windows',
+        'Xbox',
+    ]
+
+    preset_checkboxes: dict[str, QCheckBox] = {}
+    presets_num_columns = 3
+    for i, preset_name in enumerate(preset_names):
+        checkbox = QCheckBox(preset_name)
+        checkbox.setObjectName(preset_name)
+        preset_checkboxes[preset_name] = checkbox
+        presets_grid.addWidget(checkbox, i // presets_num_columns, i % presets_num_columns)
+    presets_grid.setRowStretch(presets_grid.rowCount(), 1)
+
+    preset_button_select_all = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'select_all.svg')), ' Tout sélectionner')
+    preset_button_deselect_all = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'unselect_all.svg')), ' Tout désélectionner')
+    preset_button_reset = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'reset_default.svg')), ' Par défaut')
+    preset_button_reset.setToolTip('Revenir aux préréglages par défaut')
+    for button in (preset_button_select_all, preset_button_deselect_all):
+        button.setStyleSheet(COMPACT_BUTTON_STYLESHEET)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+    preset_button_reset.setStyleSheet(COMPACT_DANGER_BUTTON_STYLESHEET)
+    preset_button_reset.setCursor(Qt.CursorShape.PointingHandCursor)
+    preset_button_reset.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+    preset_button_row = QHBoxLayout()
+    preset_button_row.setContentsMargins(0, 0, 0, 0)
+    preset_button_row.setSpacing(6)
+    preset_button_row.addWidget(preset_button_select_all)
+    preset_button_row.addWidget(preset_button_deselect_all)
+    preset_button_row.addStretch()
+    preset_button_row.addWidget(preset_button_reset)
+
+    presets_layout = QVBoxLayout(presets_group)
+    presets_layout.setSpacing(4)
+    presets_layout.addLayout(preset_button_row)
+    presets_layout.addWidget(presets_grid_container)
+
+    # Checklist container
+    checklist_group = QGroupBox(meta.display_label.replace('&', '&&'))
+    tooltip = format_setting_tooltip(meta)
+    if tooltip:
+        checklist_group.setToolTip(tooltip)
+
+    grid_container = QWidget()
+    grid = QGridLayout(grid_container)
+    grid.setContentsMargins(4, 4, 4, 4)
+    grid.setSpacing(2)
+
+    checkboxes: dict[str, QCheckBox] = {}
+    column_count = 3
+    for i, column_name in enumerate(allowed_columns):
+        display_text = display_labels.get(column_name, column_name)
+        checkbox = QCheckBox(display_text)
+        checkbox.setObjectName(column_name)
+        checkboxes[column_name] = checkbox
+        grid.addWidget(checkbox, i // column_count, i % column_count)
+    grid.setRowStretch(grid.rowCount(), 1)
+
+    button_select_all = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'select_all.svg')), ' Tout sélectionner')
+    button_deselect_all = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'unselect_all.svg')), ' Tout désélectionner')
+    button_reset = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'reset_default.svg')), ' Par défaut')
+    button_reset.setToolTip('Revenir aux options par défaut')
+    for button in (button_select_all, button_deselect_all):
+        button.setStyleSheet(COMPACT_BUTTON_STYLESHEET)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+    button_reset.setStyleSheet(COMPACT_DANGER_BUTTON_STYLESHEET)
+    button_reset.setCursor(Qt.CursorShape.PointingHandCursor)
+    button_reset.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+    button_select_all.clicked.connect(lambda: set_all_checkboxes(grid_container, checked=True))
+    button_deselect_all.clicked.connect(lambda: set_all_checkboxes(grid_container, checked=False))
+    button_reset.clicked.connect(lambda: set_checkboxes_to(grid_container, default_columns))
+
+    button_row = QHBoxLayout()
+    button_row.setContentsMargins(0, 0, 0, 0)
+    button_row.setSpacing(6)
+    button_row.addWidget(button_select_all)
+    button_row.addWidget(button_deselect_all)
+    button_row.addStretch()
+    button_row.addWidget(button_reset)
+
+    group_layout = QVBoxLayout(checklist_group)
+    group_layout.setSpacing(4)
+    group_layout.addLayout(button_row)
+    group_layout.addWidget(grid_container)
+
+    layout.addWidget(presets_group)
+    layout.addWidget(checklist_group)
+
+    # Preset mappings
+    presets_map: dict[str, set[str]] = {
+        'Azar': {
+            'CLOUDFLARE',
+            'GOOGLE_LLC',
+            'MICROSOFT',
+        },
+        'Borderlands 2': {
+            'AMAZON',
+            'GOOGLE_LLC',
+        },
+        'Borderlands 3': {
+            'MICROSOFT',
+            'UNITY_TECHNOLOGIES_APS',
+        },
+        'Borderlands 4': {
+            'AMAZON',
+            'MICROSOFT',
+            'UNITY_TECHNOLOGIES_APS',
+        },
+        'Borderlands: The Pre-Sequel': {
+            'GOOGLE_LLC',
+        },
+        'Call of Duty®: Advanced Warfare': {
+            'COMVIVE_SERVIDORES',
+            'DEMONWARE',
+            'DIMENSION_DATA',
+            'LATITUDE_SH',
+            'LEVEL_3_PARENT',
+            'THE_CONSTANT_COMPANY',
+        },
+        'Call of Duty®: Black Ops': {
+            'DEMONWARE',
+            'MICROSOFT',
+            'THE_CONSTANT_COMPANY',
+            'UK_MINISTRY_OF_DEFENCE',
+            'US_DEPARTMENT_OF_DEFENSE',
+        },
+        'Call of Duty®: Black Ops Cold War': {
+            'DEMONWARE',
+            'THE_CONSTANT_COMPANY',
+        },
+        'Call of Duty®: Black Ops II': {
+            'DEMONWARE',
+        },
+        'Call of Duty®: Black Ops III': {
+            'DEMONWARE',
+            'DIMENSION_DATA',
+            'LATITUDE_SH',
+            'THE_CONSTANT_COMPANY',
+            'SEFLOW',
+        },
+        'Call of Duty®: Ghosts': {
+            'COMVIVE_SERVIDORES',
+            'DEMONWARE',
+            'DIMENSION_DATA',
+            'LATITUDE_SH',
+            'LEVEL_3_PARENT',
+            'THE_CONSTANT_COMPANY',
+            'SEFLOW',
+        },
+        'Call of Duty®: Infinite Warfare': {
+            'DEMONWARE',
+            'THE_CONSTANT_COMPANY',
+            'SEFLOW',
+        },
+        'Call of Duty®: Modern Warfare® 2 (2009)': {
+            'DEMONWARE',
+        },
+        'Call of Duty®: Modern Warfare® 3 (2011)': {
+            'DEMONWARE',
+        },
+        'Call of Duty®: Vanguard': {
+            'DEMONWARE',
+            'THE_CONSTANT_COMPANY',
+        },
+        'Call of Duty®: WWII': {
+            'DEMONWARE',
+            'FRIEND_IT',
+            'LATITUDE_SH',
+            'MICROSOFT',
+            'TENCENT',
+            'THE_CONSTANT_COMPANY',
+            'SEFLOW',
+            'US_DEPARTMENT_OF_DEFENSE',
+        },
+        'Chatspin': {
+            'GOOGLE_LLC',
+        },
+        'Deep Rock Galactic': {
+            'US_DEPARTMENT_OF_DEFENSE',
+        },
+        'Discord': {
+            'CLOUDFLARE',
+            'DISCORD',
+        },
+        'Dying Light': {
+            'AMAZON',
+            'GOOGLE_LLC',
+            'US_DEPARTMENT_OF_DEFENSE',
+        },
+        'Dying Light 2': {
+            'AMAZON',
+        },
+        'Grand Theft Auto Online': {
+            'BATTLEYE',
+            'MICROSOFT',
+            'TAKETWO_INTERACTIVE',
+            'TELLAS_GREECE',
+            'UK_MINISTRY_OF_DEFENCE',
+            'US_DEPARTMENT_OF_DEFENSE',
+        },
+        "John Carpenter's Toxic Commando": {
+            'COMNET_INTERNATIONAL_BV',
+            'G_CORE_LABS',
+            'GOOGLE_LLC',
+            'MICROSOFT',
+            'SERVERS_COM',
+            'US_DEPARTMENT_OF_DEFENSE',
+            'ZENLAYER',
+        },
+        'Minecraft Bedrock Edition': {
+            'MICROSOFT',
+        },
+        'Monopoly Madness': {
+            'AMAZON',
+        },
+        'Mortal Kombat 11': {
+            'US_DEPARTMENT_OF_DEFENSE',
+        },
+        'Mortal Kombat X': {
+            'MICROSOFT',
+            'US_DEPARTMENT_OF_DEFENSE',
+        },
+        'Need for Speed™ Most Wanted': {
+            'EA',
+            'I3D_NET',
+            'MICROSOFT',
+        },
+        'NEW MONOPOLY®': {
+            'AMAZON',
+        },
+        'OmeTV': {
+            'GOOGLE_LLC',
+            'OVH',
+        },
+        'Payday 2': {
+            'AMAZON',
+            'US_DEPARTMENT_OF_DEFENSE',
+        },
+        'PlayStation Party Chat': {
+            'PLAYSTATION_SONY',
+        },
+        'Ready or Not': {
+            'AMAZON',
+        },
+        'Red Dead Online': {
+            'MICROSOFT',
+            'TAKETWO_INTERACTIVE',
+            'UK_MINISTRY_OF_DEFENCE',
+            'US_DEPARTMENT_OF_DEFENSE',
+        },
+        'Risk of Rain 2': {
+            'AMAZON',
+            'US_DEPARTMENT_OF_DEFENSE',
+        },
+        'RustDesk': {
+            'RUSTDESK',
+        },
+        'Sniper Elite 3': {
+            'LIMESTONE_NETWORKS',
+        },
+        'Steam': {
+            'VALVE',
+        },
+        'The Division 2': {
+            'CLOUDFLARE',
+            'MICROSOFT',
+        },
+        'theHunter Call of the Wild™': {
+            'AMAZON',
+            'MICROSOFT',
+            'US_DEPARTMENT_OF_DEFENSE',
+        },
+        'theHunter Classic': {
+            'AMAZON',
+            'GOOGLE_LLC',
+        },
+        "Tom Clancy's Ghost Recon® Breakpoint": {
+            'AMAZON',
+            'I3D_NET',
+        },
+        'UNO': {
+            'AMAZON',
+            'I3D_NET',
+            'MICROSOFT',
+            'US_DEPARTMENT_OF_DEFENSE',
+        },
+        'Warframe': {
+            'AKAMAI_CONNECTED_CLOUD',
+        },
+        'Watch Dogs® 2': {
+            'I3D_NET',
+            'UK_MINISTRY_OF_DEFENCE',
+            'US_DEPARTMENT_OF_DEFENSE',
+        },
+        'Windows': {
+            'MICROSOFT',
+        },
+        'Xbox': {
+            'MICROSOFT',
+        },
+    }
+
+    is_updating = False
+
+    def update_presets_from_ranges() -> None:
+        nonlocal is_updating
+        if is_updating:
+            return
+        is_updating = True
+        try:
+            checked_ranges = {range_name for range_name, checkbox in checkboxes.items() if checkbox.isChecked()}
+            for preset_name, preset_set in presets_map.items():
+                is_active = preset_set.issubset(checked_ranges)
+                preset_checkboxes[preset_name].blockSignals(True)  # noqa: FBT003
+                preset_checkboxes[preset_name].setChecked(is_active)
+                preset_checkboxes[preset_name].blockSignals(False)  # noqa: FBT003
+        finally:
+            is_updating = False
+
+    def on_preset_clicked(pname: str, checked: bool) -> None:  # noqa: FBT001
+        nonlocal is_updating
+        if is_updating:
+            return
+        is_updating = True
+        try:
+            preset_set = presets_map[pname]
+            if checked:
+                for rname in preset_set:
+                    if rname in checkboxes:
+                        checkboxes[rname].blockSignals(True)  # noqa: FBT003
+                        checkboxes[rname].setChecked(True)
+                        checkboxes[rname].blockSignals(False)  # noqa: FBT003
+            else:
+                for rname in preset_set:
+                    if rname in checkboxes:
+                        checkboxes[rname].blockSignals(True)  # noqa: FBT003
+                        checkboxes[rname].setChecked(False)
+                        checkboxes[rname].blockSignals(False)  # noqa: FBT003
+
+            checked_ranges = {range_name for range_name, checkbox in checkboxes.items() if checkbox.isChecked()}
+            for other_name, other_set in presets_map.items():
+                is_active = other_set.issubset(checked_ranges)
+                preset_checkboxes[other_name].blockSignals(True)  # noqa: FBT003
+                preset_checkboxes[other_name].setChecked(is_active)
+                preset_checkboxes[other_name].blockSignals(False)  # noqa: FBT003
+        finally:
+            is_updating = False
+
+    def make_handler(name: str) -> Callable[[bool], None]:
+        def handler(checked: bool) -> None:  # noqa: FBT001
+            on_preset_clicked(name, checked)
+
+        return handler
+
+    def select_all_presets() -> None:
+        nonlocal is_updating
+        is_updating = True
+        try:
+            for checkbox in preset_checkboxes.values():
+                checkbox.blockSignals(True)  # noqa: FBT003
+                checkbox.setChecked(True)
+                checkbox.blockSignals(False)  # noqa: FBT003
+            for preset_set in presets_map.values():
+                for rname in preset_set:
+                    if rname in checkboxes:
+                        checkboxes[rname].blockSignals(True)  # noqa: FBT003
+                        checkboxes[rname].setChecked(True)
+                        checkboxes[rname].blockSignals(False)  # noqa: FBT003
+        finally:
+            is_updating = False
+        update_presets_from_ranges()
+
+    def deselect_all_presets() -> None:
+        nonlocal is_updating
+        is_updating = True
+        try:
+            for checkbox in preset_checkboxes.values():
+                checkbox.blockSignals(True)  # noqa: FBT003
+                checkbox.setChecked(False)
+                checkbox.blockSignals(False)  # noqa: FBT003
+            for preset_set in presets_map.values():
+                for rname in preset_set:
+                    if rname in checkboxes:
+                        checkboxes[rname].blockSignals(True)  # noqa: FBT003
+                        checkboxes[rname].setChecked(False)
+                        checkboxes[rname].blockSignals(False)  # noqa: FBT003
+        finally:
+            is_updating = False
+        update_presets_from_ranges()
+
+    def reset_presets() -> None:
+        set_checkboxes_to(grid_container, default_columns)
+
+    preset_button_select_all.clicked.connect(select_all_presets)
+    preset_button_deselect_all.clicked.connect(deselect_all_presets)
+    preset_button_reset.clicked.connect(reset_presets)
+
+    for preset_name, preset_checkbox in preset_checkboxes.items():
+        preset_checkbox.clicked.connect(make_handler(preset_name))
+
+    for checkbox in checkboxes.values():
+        checkbox.toggled.connect(update_presets_from_ranges)
+
+    update_presets_from_ranges()
+
+    return container
+
+
+class _AutoFitListWidget(QListWidget):
+    """List widget that pads its size hint to avoid spurious scrollbars."""
+
+    @override
+    def sizeHint(self) -> QSize:
+        """Return a slightly padded size hint to prevent spurious scrollbars."""
+        hint = super().sizeHint()
+        if not self.count():
+            return QSize(hint.width(), 44)
+        return QSize(hint.width(), hint.height() + 10)
+
+
+def create_ip_range_tuple_widget(meta: SettingMeta, parent: QWidget) -> QGroupBox:
+    """Create an add/remove list widget for managing a tuple of IP addresses and ranges."""
+    group = QGroupBox(meta.display_label.replace('&', '&&'))
+    tooltip = format_setting_tooltip(meta)
+    if tooltip:
+        group.setToolTip(tooltip)
+
+    list_widget = _AutoFitListWidget()
+    list_widget.setSizeAdjustPolicy(QListWidget.SizeAdjustPolicy.AdjustToContents)
+    list_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    list_widget.setMaximumHeight(250)
+    list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    list_widget.setItemDelegate(ElidedTextTooltipDelegate(list_widget))
+    list_widget.setWordWrap(False)
+    list_widget.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+    list_widget.setSortingEnabled(True)
+
+    add_button = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'add.svg')), ' Ajouter')
+    add_button.setToolTip('Ajouter une adresse IP, plage ou sous-réseau à bloquer')
+    add_button.setStyleSheet(COMPACT_BUTTON_STYLESHEET)
+    add_button.setCursor(Qt.CursorShape.PointingHandCursor)
+    add_button.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+    remove_button = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')), ' Supprimer')
+    remove_button.setToolTip('Supprimer les entrées sélectionnées')
+    remove_button.setStyleSheet(COMPACT_DANGER_BUTTON_STYLESHEET)
+    remove_button.setCursor(Qt.CursorShape.PointingHandCursor)
+    remove_button.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+    remove_button.setEnabled(False)
+    list_widget.itemSelectionChanged.connect(lambda: remove_button.setEnabled(bool(list_widget.selectedItems())))
+
+    def _add_entry() -> None:
+        dialog = IPRangeBuilderDialog(parent)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        entry = dialog.result_entry()
+        if not entry:
+            return
+        existing = {item.text() for i in range(list_widget.count()) if (item := list_widget.item(i))}
+        if entry not in existing:
+            list_widget.addItem(entry)
+
+    def _remove_entries() -> None:
+        for item in list_widget.selectedItems():
+            list_widget.takeItem(list_widget.row(item))
+
+    add_button.clicked.connect(_add_entry)
+    remove_button.clicked.connect(_remove_entries)
+
+    button_row = QHBoxLayout()
+    button_row.setContentsMargins(0, 0, 0, 0)
+    button_row.setSpacing(6)
+    button_row.addWidget(add_button)
+    button_row.addWidget(remove_button)
+    button_row.addStretch()
+
+    outer_layout = QVBoxLayout(group)
+    outer_layout.setSpacing(4)
+    outer_layout.addLayout(button_row)
+    outer_layout.addWidget(list_widget, 1)
+    return group
+
+
+def create_string_tuple_widget(
+    meta: SettingMeta,
+    parent: QWidget,
+    *,
+    input_dialog_title: str = 'Ajouter un FAI / ASN filtré',
+    input_dialog_label: str = "Entre un nom de FAI ou d'ASN (ex. Take-Two, Amazon, Hetzner, AS15169) :",
+) -> QGroupBox:
+    """Create an add/remove list widget for managing a tuple of strings."""
+    group = QGroupBox(meta.display_label.replace('&', '&&'))
+    tooltip = format_setting_tooltip(meta)
+    if tooltip:
+        group.setToolTip(tooltip)
+
+    list_widget = _AutoFitListWidget()
+    list_widget.setSizeAdjustPolicy(QListWidget.SizeAdjustPolicy.AdjustToContents)
+    list_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    list_widget.setMaximumHeight(250)
+    list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    list_widget.setItemDelegate(ElidedTextTooltipDelegate(list_widget))
+    list_widget.setWordWrap(False)
+    list_widget.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+    list_widget.setSortingEnabled(True)
+
+    add_button = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'add.svg')), ' Ajouter')
+    add_button.setToolTip('Ajouter une entrée à la liste')
+    add_button.setStyleSheet(COMPACT_BUTTON_STYLESHEET)
+    add_button.setCursor(Qt.CursorShape.PointingHandCursor)
+    add_button.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+    remove_button = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')), ' Supprimer')
+    remove_button.setToolTip('Supprimer les entrées sélectionnées')
+    remove_button.setStyleSheet(COMPACT_DANGER_BUTTON_STYLESHEET)
+    remove_button.setCursor(Qt.CursorShape.PointingHandCursor)
+    remove_button.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+    remove_button.setEnabled(False)
+    list_widget.itemSelectionChanged.connect(lambda: remove_button.setEnabled(bool(list_widget.selectedItems())))
+
+    def _add_entry() -> None:
+        text, success = QInputDialog.getText(parent, input_dialog_title, input_dialog_label)
+        if not success or not (entry := text.strip()):
+            return
+        existing = {item.text() for i in range(list_widget.count()) if (item := list_widget.item(i))}
+        if entry not in existing:
+            list_widget.addItem(entry)
+
+    def _remove_entries() -> None:
+        for item in list_widget.selectedItems():
+            list_widget.takeItem(list_widget.row(item))
+
+    add_button.clicked.connect(_add_entry)
+    remove_button.clicked.connect(_remove_entries)
+
+    button_row = QHBoxLayout()
+    button_row.setContentsMargins(0, 0, 0, 0)
+    button_row.setSpacing(6)
+    button_row.addWidget(add_button)
+    button_row.addWidget(remove_button)
+    button_row.addStretch()
+
+    outer_layout = QVBoxLayout(group)
+    outer_layout.setSpacing(4)
+    outer_layout.addLayout(button_row)
+    outer_layout.addWidget(list_widget, 1)
+    return group
+
+
+def set_all_checkboxes(container: QWidget, *, checked: bool) -> None:
+    """Set all QCheckBox children of `container` to `checked`."""
+    for checkbox in container.findChildren(QCheckBox):
+        checkbox.setChecked(checked)
+
+
+def set_checkboxes_to(container: QWidget, selected: tuple[str, ...]) -> None:
+    """Check exactly the QCheckBox children whose objectName is in `selected`."""
+    wanted = set(selected)
+    for checkbox in container.findChildren(QCheckBox):
+        checkbox.setChecked(checkbox.objectName() in wanted)
+
+
+def get_line_edit(widget: QWidget) -> QLineEdit:
+    """Return the `QLineEdit` from *widget*, which may itself be a `QLineEdit` or a container holding one."""
+    if isinstance(widget, QLineEdit):
+        return widget
+    child = widget.findChild(QLineEdit)
+    if child is None:
+        message = f'No QLineEdit child found in {widget!r}'
+        raise RuntimeError(message)
+    return child
+
+
+def build_discord_info_group() -> QGroupBox:
+    """Build a Discord server invite header for the Discord settings tab."""
+    group_box = QGroupBox('Communauté BTX')
+    layout = QVBoxLayout(group_box)
+
+    info_label = QLabel(
+        f'Rejoins le serveur Discord BTX pour l\'aide, les annonces et discuter avec la communauté.<br><br><a href="{DISCORD_INVITE_URL}" title="{DISCORD_INVITE_URL}" style="color: #f25ecb; text-decoration: underline;">{DISCORD_INVITE_URL}</a>',
+    )
+    info_label.setWordWrap(True)
+    info_label.setTextFormat(Qt.TextFormat.RichText)
+    info_label.setOpenExternalLinks(True)
+    info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+    info_label.setStyleSheet(DISCORD_INFO_LABEL_STYLESHEET)
+    info_label.linkHovered.connect(info_label.setToolTip)
+    layout.addWidget(info_label)
+
+    return group_box
+
+
+def build_webserver_help_group() -> QGroupBox:
+    """Build an explanatory guide for Web Server host/port behavior and common usage patterns."""
+    group_box = QGroupBox('Guide du serveur web')
+    layout = QVBoxLayout(group_box)
+
+    help_label = QLabel(
+        "<b>L'adresse d'écoute expliquée</b><br><b>127.0.0.1</b> (ou localhost) : seul ce PC peut ouvrir le panneau.<br><b>0.0.0.0</b> : écoute sur toutes les interfaces, les autres appareils de ton réseau local peuvent se connecter.<br><br><b>Configurations courantes</b><br>- PC uniquement : host = 127.0.0.1<br>- Téléphone/tablette sur le même Wi-Fi : host = 0.0.0.0, puis ouvre http://&lt;IP_LOCALE_DU_PC&gt;:&lt;PORT&gt;/<br><br><b>Dépannage</b><br>- Le téléphone et le PC doivent être sur le même réseau local (évite le Wi-Fi invité/isolé).<br>- Si les autres appareils n'arrivent pas à se connecter, autorise le TCP entrant sur le port choisi dans le pare-feu Windows.<br>- Si le port 80 est déjà utilisé par une autre app, choisis un autre port (par exemple 8091).<br>- Utilise http:// (pas https://) sauf si tu ajoutes ton propre proxy TLS.<br><br><b>Sécurité</b><br>Avec 0.0.0.0, n'importe qui sur le même réseau autorisé peut accéder au panneau.<br>Utilise des réseaux de confiance et limite l'accès avec le pare-feu.",
+    )
+    help_label.setWordWrap(True)
+    help_label.setTextFormat(Qt.TextFormat.RichText)
+    help_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    help_label.setStyleSheet(WEBSERVER_HELP_LABEL_STYLESHEET)
+    layout.addWidget(help_label)
+
+    return group_box

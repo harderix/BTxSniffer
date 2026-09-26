@@ -1,0 +1,31 @@
+"""Live BPS graph window for the current capture session."""
+
+from typing import override
+
+from session_sniffer.guis.player_rate_graph import SingleRateGraphBase
+
+_FLOOR_KBS = 1.0
+_BYTES_TO_KBS = 1024
+
+
+class SessionBpsGraphWindow(SingleRateGraphBase):
+    """A standalone window displaying live bandwidth (KB/s) over time for the whole session."""
+
+    WINDOW_TITLE = 'Graphique BPS de la session'
+    LEFT_LABEL = 'Ko/s'
+    AXIS_PEN = '#00bbd4'
+    CURVE_PEN = '#00bbd4'
+    CURVE_BRUSH = (0, 188, 212, 60)
+    AVG_PEN = '#0094a7'
+    Y_FLOOR = _FLOOR_KBS
+
+    @override
+    def _transform_sample(self, sample: float) -> float:
+        """Convert bytes per second into KB/s for display."""
+        return sample / _BYTES_TO_KBS
+
+    # Public API —————————————————————————————————————————————————————————————
+
+    def update_bps(self, bps: int) -> None:
+        """Append a new BPS sample (bytes/s) and refresh the graph."""
+        self.update_graph(bps)

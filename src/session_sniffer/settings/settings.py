@@ -1,0 +1,418 @@
+"""Settings loading, validation, and persistence."""
+
+import logging
+import re
+from typing import TYPE_CHECKING, Any, ClassVar
+
+from session_sniffer import msgbox
+from session_sniffer.constants.local import SETTINGS_PATH
+from session_sniffer.constants.standalone import (
+    BANDWIDTH_STAT_COLUMNS,
+    CAPTURE_FILTER_BLOCK_SETTINGS,
+    CONNECTED_RATE_STAT_COLUMNS,
+    DATETIME_TRACKING_COLUMNS,
+    LOCATION_COLUMNS,
+    ORGANIZATION_COLUMNS,
+    PACKET_STAT_COLUMNS,
+    PORT_COLUMNS,
+    SESSION_TRACKING_COLUMNS,
+    STATUS_COLUMNS,
+    TITLE,
+)
+from session_sniffer.error_messages import ensure_instance, format_invalid_datetime_columns_settings_message
+from session_sniffer.logging_setup import clear_secret_cache
+from session_sniffer.models.settings_ini_model import SettingsIniModel, SettingsValidationConfig
+from session_sniffer.networking.ip_range import IPRange, parse_ip_range
+from session_sniffer.networking.third_party_servers import ALL_THIRD_PARTY_SERVER_NAMES
+from session_sniffer.settings.defaults import SETTING_DEFAULTS
+from session_sniffer.text_templates import build_settings_ini_header_text
+from session_sniffer.text_utils import format_triple_quoted_text
+from session_sniffer.utils import validate_file
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+RE_SETTINGS_INI_PARSER_PATTERN = re.compile(r'^(?![;#])(?P<key>[^=]+)=(?P<value>[^;#]+)')
+
+
+class Settings:
+    """Load, validate, and persist user settings for the application."""
+
+    capture_interface_name: str | None = SETTING_DEFAULTS['capture_interface_name']
+    capture_ip_address: str | None = SETTING_DEFAULTS['capture_ip_address']
+    capture_mac_address: str | None = SETTING_DEFAULTS['capture_mac_address']
+    capture_arp_spoofing: bool = SETTING_DEFAULTS['capture_arp_spoofing']
+    capture_block_third_party_servers: tuple[str, ...] = SETTING_DEFAULTS['capture_block_third_party_servers']
+    capture_blocked_ips: tuple[str, ...] = SETTING_DEFAULTS['capture_blocked_ips']
+    capture_filtered_isps: tuple[str, ...] = SETTING_DEFAULTS['capture_filtered_isps']
+    capture_feature_set: str | None = SETTING_DEFAULTS['capture_feature_set']
+    capture_filter_process_pid: int = SETTING_DEFAULTS['capture_filter_process_pid']
+    capture_overflow_timer: int = SETTING_DEFAULTS['capture_overflow_timer']
+    capture_ps3_name_resolver: bool = SETTING_DEFAULTS['capture_ps3_name_resolver']
+    capture_prepend_custom_capture_filter: str | None = SETTING_DEFAULTS['capture_prepend_custom_capture_filter']
+    capture_filter_block_rtcp: bool = SETTING_DEFAULTS['capture_filter_block_rtcp']
+    capture_filter_block_ssdp: bool = SETTING_DEFAULTS['capture_filter_block_ssdp']
+    capture_filter_block_raknet: bool = SETTING_DEFAULTS['capture_filter_block_raknet']
+    capture_filter_block_dtls: bool = SETTING_DEFAULTS['capture_filter_block_dtls']
+    capture_filter_block_uaudp: bool = SETTING_DEFAULTS['capture_filter_block_uaudp']
+    capture_filter_block_classicstun: bool = SETTING_DEFAULTS['capture_filter_block_classicstun']
+    capture_filter_block_llmnr: bool = SETTING_DEFAULTS['capture_filter_block_llmnr']
+    gui_always_on_top: bool = SETTING_DEFAULTS['gui_always_on_top']
+    gui_remember_window_layout: bool = SETTING_DEFAULTS['gui_remember_window_layout']
+    gui_servers_color_enabled: bool = SETTING_DEFAULTS['gui_servers_color_enabled']
+    gui_servers_color: str = SETTING_DEFAULTS['gui_servers_color']
+    gui_interface_selection_auto_connect: bool = SETTING_DEFAULTS['gui_interface_selection_auto_connect']
+    gui_interface_selection_hide_inactive: bool = SETTING_DEFAULTS['gui_interface_selection_hide_inactive']
+    gui_interface_selection_hide_neighbours: bool = SETTING_DEFAULTS['gui_interface_selection_hide_neighbours']
+    gui_sessions_logging: bool = SETTING_DEFAULTS['gui_sessions_logging']
+    gui_sessions_logging_delete_empty_files: bool = SETTING_DEFAULTS['gui_sessions_logging_delete_empty_files']
+    gui_sessions_logging_delete_empty_folders: bool = SETTING_DEFAULTS['gui_sessions_logging_delete_empty_folders']
+    gui_reset_ports_on_rejoins: bool = SETTING_DEFAULTS['gui_reset_ports_on_rejoins']
+    gui_session_host_detection: bool = SETTING_DEFAULTS['gui_session_host_detection']
+    gui_session_host_icon: bool = SETTING_DEFAULTS['gui_session_host_icon']
+    gui_columns_connected_shown: tuple[str, ...] = SETTING_DEFAULTS['gui_columns_connected_shown']
+    gui_columns_disconnected_shown: tuple[str, ...] = SETTING_DEFAULTS['gui_columns_disconnected_shown']
+    gui_columns_datetime_show_date: bool = SETTING_DEFAULTS['gui_columns_datetime_show_date']
+    gui_columns_datetime_show_time: bool = SETTING_DEFAULTS['gui_columns_datetime_show_time']
+    gui_columns_datetime_show_elapsed_time: bool = SETTING_DEFAULTS['gui_columns_datetime_show_elapsed_time']
+    gui_columns_timezone_display: str = SETTING_DEFAULTS['gui_columns_timezone_display']
+    gui_columns_geo_country_append_alpha2: bool = SETTING_DEFAULTS['gui_columns_geo_country_append_alpha2']
+    gui_columns_geo_continent_append_alpha2: bool = SETTING_DEFAULTS['gui_columns_geo_continent_append_alpha2']
+    gui_connected_table_rows_per_page: int = SETTING_DEFAULTS['gui_connected_table_rows_per_page']
+    gui_connected_table_sort_column: str = SETTING_DEFAULTS['gui_connected_table_sort_column']
+    gui_connected_table_sort_order: str = SETTING_DEFAULTS['gui_connected_table_sort_order']
+    gui_disconnected_players_enabled: bool = SETTING_DEFAULTS['gui_disconnected_players_enabled']
+    gui_disconnected_table_rows_per_page: int = SETTING_DEFAULTS['gui_disconnected_table_rows_per_page']
+    gui_disconnected_table_sort_column: str = SETTING_DEFAULTS['gui_disconnected_table_sort_column']
+    gui_disconnected_table_sort_order: str = SETTING_DEFAULTS['gui_disconnected_table_sort_order']
+    gui_disconnected_players_timer: int = SETTING_DEFAULTS['gui_disconnected_players_timer']
+    gui_ignore_screen_resolution_warning: bool = SETTING_DEFAULTS['gui_ignore_screen_resolution_warning']
+    voice_notifications_enabled: bool = SETTING_DEFAULTS['voice_notifications_enabled']
+    pinger_local: bool = SETTING_DEFAULTS['pinger_local']
+    discord_presence: bool = SETTING_DEFAULTS['discord_presence']
+    discord_presence_title: str = SETTING_DEFAULTS['discord_presence_title']
+    show_discord_popup: bool = SETTING_DEFAULTS['show_discord_popup']
+    discord_webhook_enabled: bool = SETTING_DEFAULTS['discord_webhook_enabled']
+    discord_webhook_url: str | None = SETTING_DEFAULTS['discord_webhook_url']
+    discord_webhook_refresh_interval: int = SETTING_DEFAULTS['discord_webhook_refresh_interval']
+    discord_webhook_include_connected: bool = SETTING_DEFAULTS['discord_webhook_include_connected']
+    discord_webhook_include_disconnected: bool = SETTING_DEFAULTS['discord_webhook_include_disconnected']
+    discord_webhook_max_rows_per_table: int = SETTING_DEFAULTS['discord_webhook_max_rows_per_table']
+    discord_webhook_max_connected_players: int = SETTING_DEFAULTS['discord_webhook_max_connected_players']
+    discord_webhook_max_disconnected_players: int = SETTING_DEFAULTS['discord_webhook_max_disconnected_players']
+    discord_webhook_format: str = SETTING_DEFAULTS['discord_webhook_format']
+    discord_webhook_columns_connected: tuple[str, ...] = SETTING_DEFAULTS['discord_webhook_columns_connected']
+    discord_webhook_columns_disconnected: tuple[str, ...] = SETTING_DEFAULTS['discord_webhook_columns_disconnected']
+    discord_webhook_message_ids: str | None = SETTING_DEFAULTS['discord_webhook_message_ids']
+    webserver_enabled: bool = SETTING_DEFAULTS['webserver_enabled']
+    webserver_host: str = SETTING_DEFAULTS['webserver_host']
+    webserver_port: int = SETTING_DEFAULTS['webserver_port']
+    webserver_username: str | None = SETTING_DEFAULTS['webserver_username']
+    webserver_password: str | None = SETTING_DEFAULTS['webserver_password']
+    updater_channel: str | None = SETTING_DEFAULTS['updater_channel']
+    looky_enabled: bool = SETTING_DEFAULTS['looky_enabled']
+    looky_exclusive_gta5_process: bool = SETTING_DEFAULTS['looky_exclusive_gta5_process']
+    looky_game_version: str = SETTING_DEFAULTS['looky_game_version']
+    looky_api_key: str | None = SETTING_DEFAULTS['looky_api_key']
+    high_rate_monitor_icon: bool = SETTING_DEFAULTS['high_rate_monitor_icon']
+    high_rate_monitor_run_in_background: bool = SETTING_DEFAULTS['high_rate_monitor_run_in_background']
+    high_rate_monitor_auto_select: bool = SETTING_DEFAULTS['high_rate_monitor_auto_select']
+    solo_session_duration: int = SETTING_DEFAULTS['solo_session_duration']
+    high_rate_monitor_pps_threshold: int = SETTING_DEFAULTS['high_rate_monitor_pps_threshold']
+    high_rate_monitor_bps_threshold: int = SETTING_DEFAULTS['high_rate_monitor_bps_threshold']
+    high_rate_monitor_duration_threshold: int = SETTING_DEFAULTS['high_rate_monitor_duration_threshold']
+    player_identifier_icon: bool = SETTING_DEFAULTS['player_identifier_icon']
+    player_identifier_spike_zscore: float = SETTING_DEFAULTS['player_identifier_spike_zscore']
+    player_identifier_spike_seconds: int = SETTING_DEFAULTS['player_identifier_spike_seconds']
+    player_identifier_baseline_seconds: int = SETTING_DEFAULTS['player_identifier_baseline_seconds']
+    player_identifier_contamination_zscore: float = SETTING_DEFAULTS['player_identifier_contamination_zscore']
+    player_identifier_contamination_seconds: int = SETTING_DEFAULTS['player_identifier_contamination_seconds']
+    player_identifier_contamination_min_samples: int = SETTING_DEFAULTS['player_identifier_contamination_min_samples']
+    player_identifier_baseline_timeout: int = SETTING_DEFAULTS['player_identifier_baseline_timeout']
+    player_identifier_session_drift_zscore: float = SETTING_DEFAULTS['player_identifier_session_drift_zscore']
+
+    MIN_GUI_DISCONNECTED_PLAYERS_TIMER_SECONDS: ClassVar[int] = 3
+    MAX_GUI_TABLE_ROWS_PER_PAGE: ClassVar[int] = 5000
+    blocked_ip_ranges: ClassVar[list[IPRange]] = []
+
+    ALL_SETTINGS: ClassVar[tuple[str, ...]] = (
+        'CAPTURE_INTERFACE_NAME',
+        'CAPTURE_IP_ADDRESS',
+        'CAPTURE_MAC_ADDRESS',
+        'CAPTURE_ARP_SPOOFING',
+        'CAPTURE_BLOCK_THIRD_PARTY_SERVERS',
+        'CAPTURE_BLOCKED_IPS',
+        'CAPTURE_FILTERED_ISPS',
+        'CAPTURE_FEATURE_SET',
+        'CAPTURE_FILTER_PROCESS_PID',
+        'CAPTURE_OVERFLOW_TIMER',
+        'CAPTURE_PS3_NAME_RESOLVER',
+        'CAPTURE_PREPEND_CUSTOM_CAPTURE_FILTER',
+        *CAPTURE_FILTER_BLOCK_SETTINGS,
+        'GUI_ALWAYS_ON_TOP',
+        'GUI_REMEMBER_WINDOW_LAYOUT',
+        'GUI_SERVERS_COLOR_ENABLED',
+        'GUI_SERVERS_COLOR',
+        'GUI_INTERFACE_SELECTION_AUTO_CONNECT',
+        'GUI_INTERFACE_SELECTION_HIDE_INACTIVE',
+        'GUI_INTERFACE_SELECTION_HIDE_NEIGHBOURS',
+        'GUI_SESSIONS_LOGGING',
+        'GUI_SESSIONS_LOGGING_DELETE_EMPTY_FILES',
+        'GUI_SESSIONS_LOGGING_DELETE_EMPTY_FOLDERS',
+        'GUI_RESET_PORTS_ON_REJOINS',
+        'GUI_SESSION_HOST_DETECTION',
+        'GUI_SESSION_HOST_ICON',
+        'GUI_COLUMNS_CONNECTED_SHOWN',
+        'GUI_COLUMNS_DISCONNECTED_SHOWN',
+        'GUI_COLUMNS_DATETIME_SHOW_DATE',
+        'GUI_COLUMNS_DATETIME_SHOW_TIME',
+        'GUI_COLUMNS_DATETIME_SHOW_ELAPSED_TIME',
+        'GUI_COLUMNS_TIMEZONE_DISPLAY',
+        'GUI_COLUMNS_GEO_COUNTRY_APPEND_ALPHA2',
+        'GUI_COLUMNS_GEO_CONTINENT_APPEND_ALPHA2',
+        'GUI_CONNECTED_TABLE_ROWS_PER_PAGE',
+        'GUI_CONNECTED_TABLE_SORT_COLUMN',
+        'GUI_CONNECTED_TABLE_SORT_ORDER',
+        'GUI_DISCONNECTED_PLAYERS_ENABLED',
+        'GUI_DISCONNECTED_TABLE_ROWS_PER_PAGE',
+        'GUI_DISCONNECTED_TABLE_SORT_COLUMN',
+        'GUI_DISCONNECTED_TABLE_SORT_ORDER',
+        'GUI_DISCONNECTED_PLAYERS_TIMER',
+        'GUI_IGNORE_SCREEN_RESOLUTION_WARNING',
+        'VOICE_NOTIFICATIONS_ENABLED',
+        'DISCORD_PRESENCE',
+        'DISCORD_PRESENCE_TITLE',
+        'SHOW_DISCORD_POPUP',
+        'DISCORD_WEBHOOK_ENABLED',
+        'DISCORD_WEBHOOK_URL',
+        'DISCORD_WEBHOOK_REFRESH_INTERVAL',
+        'DISCORD_WEBHOOK_INCLUDE_CONNECTED',
+        'DISCORD_WEBHOOK_INCLUDE_DISCONNECTED',
+        'DISCORD_WEBHOOK_MAX_ROWS_PER_TABLE',
+        'DISCORD_WEBHOOK_MAX_CONNECTED_PLAYERS',
+        'DISCORD_WEBHOOK_MAX_DISCONNECTED_PLAYERS',
+        'DISCORD_WEBHOOK_FORMAT',
+        'DISCORD_WEBHOOK_COLUMNS_CONNECTED',
+        'DISCORD_WEBHOOK_COLUMNS_DISCONNECTED',
+        'DISCORD_WEBHOOK_MESSAGE_IDS',
+        'WEBSERVER_ENABLED',
+        'WEBSERVER_HOST',
+        'WEBSERVER_PORT',
+        'WEBSERVER_USERNAME',
+        'WEBSERVER_PASSWORD',
+        'UPDATER_CHANNEL',
+        'LOOKY_ENABLED',
+        'LOOKY_EXCLUSIVE_GTA5_PROCESS',
+        'LOOKY_GAME_VERSION',
+        'LOOKY_API_KEY',
+        'PINGER_LOCAL',
+        'HIGH_RATE_MONITOR_ICON',
+        'HIGH_RATE_MONITOR_RUN_IN_BACKGROUND',
+        'HIGH_RATE_MONITOR_AUTO_SELECT',
+        'SOLO_SESSION_DURATION',
+        'HIGH_RATE_MONITOR_PPS_THRESHOLD',
+        'HIGH_RATE_MONITOR_BPS_THRESHOLD',
+        'HIGH_RATE_MONITOR_DURATION_THRESHOLD',
+        'PLAYER_IDENTIFIER_ICON',
+        'PLAYER_IDENTIFIER_SPIKE_ZSCORE',
+        'PLAYER_IDENTIFIER_SPIKE_SECONDS',
+        'PLAYER_IDENTIFIER_BASELINE_SECONDS',
+        'PLAYER_IDENTIFIER_CONTAMINATION_ZSCORE',
+        'PLAYER_IDENTIFIER_CONTAMINATION_SECONDS',
+        'PLAYER_IDENTIFIER_CONTAMINATION_MIN_SAMPLES',
+        'PLAYER_IDENTIFIER_BASELINE_TIMEOUT',
+        'PLAYER_IDENTIFIER_SESSION_DRIFT_ZSCORE',
+    )
+
+    _ALL_SETTINGS_SET: ClassVar[frozenset[str]] = frozenset(ALL_SETTINGS)
+
+    GUI_FORCED_COLUMNS: ClassVar[tuple[str, ...]] = ('Usernames', 'First Seen', 'Last Rejoin', 'Last Seen', 'Rejoins', 'IP Address')
+    ALL_THIRD_PARTY_SERVERS: ClassVar[tuple[str, ...]] = ALL_THIRD_PARTY_SERVER_NAMES
+    GUI_TOGGLEABLE_CONNECTED_COLUMNS: ClassVar[tuple[str, ...]] = (
+        'T. Session Time',
+        'Session Time',
+        *CONNECTED_RATE_STAT_COLUMNS,
+        'Hostname',
+        *PORT_COLUMNS,
+        *LOCATION_COLUMNS,
+        *ORGANIZATION_COLUMNS,
+        *STATUS_COLUMNS,
+    )
+    GUI_TOGGLEABLE_DISCONNECTED_COLUMNS: ClassVar[tuple[str, ...]] = (
+        'T. Session Time',
+        'Session Time',
+        *PACKET_STAT_COLUMNS,
+        *BANDWIDTH_STAT_COLUMNS,
+        'Hostname',
+        *PORT_COLUMNS,
+        *LOCATION_COLUMNS,
+        *ORGANIZATION_COLUMNS,
+        *STATUS_COLUMNS,
+    )
+    GUI_ALL_CONNECTED_COLUMNS: ClassVar[tuple[str, ...]] = (
+        'Usernames',
+        'First Seen',
+        'Last Rejoin',
+        *SESSION_TRACKING_COLUMNS,
+        *CONNECTED_RATE_STAT_COLUMNS,
+        'IP Address',
+        'Hostname',
+        *PORT_COLUMNS,
+        *LOCATION_COLUMNS,
+        *ORGANIZATION_COLUMNS,
+        *STATUS_COLUMNS,
+    )
+    GUI_ALL_DISCONNECTED_COLUMNS: ClassVar[tuple[str, ...]] = (
+        'Usernames',
+        *DATETIME_TRACKING_COLUMNS,
+        *SESSION_TRACKING_COLUMNS,
+        *PACKET_STAT_COLUMNS,
+        *BANDWIDTH_STAT_COLUMNS,
+        'IP Address',
+        'Hostname',
+        *PORT_COLUMNS,
+        *LOCATION_COLUMNS,
+        *ORGANIZATION_COLUMNS,
+        *STATUS_COLUMNS,
+    )
+
+    @classmethod
+    def iterate_over_settings(cls) -> Iterator[tuple[str, Any]]:
+        """Iterate over all settings and their current values."""
+        for setting_name in cls.ALL_SETTINGS:
+            yield setting_name, getattr(cls, setting_name.lower())
+
+    @classmethod
+    def is_gta5_feature_set(cls) -> bool:
+        """Return `True` when the active capture feature set is GTA V."""
+        return cls.capture_feature_set == 'GTA V'
+
+    @classmethod
+    def is_rdr2_feature_set(cls) -> bool:
+        """Return `True` when the active capture feature set is RDR2."""
+        return cls.capture_feature_set == 'RDR2'
+
+    @classmethod
+    def is_rockstar_feature_set(cls) -> bool:
+        """Return `True` when the active capture feature set is a Rockstar title (GTA V or RDR2)."""
+        return cls.capture_feature_set in ('GTA V', 'RDR2')
+
+    @classmethod
+    def is_session_host_feature_set(cls) -> bool:
+        """Return `True` when the active capture feature set supports session host detection."""
+        return cls.is_rockstar_feature_set()
+
+    @classmethod
+    def rebuild_blocked_ip_ranges(cls) -> None:
+        """Rebuild the in-memory list of parsed IPRange objects from `capture_blocked_ips`."""
+        ranges: list[IPRange] = []
+        for raw in cls.capture_blocked_ips:
+            try:
+                ranges.append(parse_ip_range(raw))
+            except (ValueError, TypeError) as e:
+                logger.warning('Failed to parse blocked IP range %r: %s', raw, e)
+        cls.blocked_ip_ranges = ranges
+
+    @classmethod
+    def rewrite_settings_file(cls) -> None:
+        """Rewrite the settings file from current in-memory values."""
+        text = build_settings_ini_header_text()
+
+        for setting_name, setting_value in cls.iterate_over_settings():
+            text += f'{setting_name}={setting_value}\n'
+
+        tmp_path: Path = SETTINGS_PATH.with_suffix('.tmp')
+        tmp_path.write_text(text, encoding='utf-8')
+        tmp_path.replace(SETTINGS_PATH)
+        clear_secret_cache()
+
+    @staticmethod
+    def parse_settings_ini_file(ini_path: Path) -> tuple[dict[str, str], bool]:
+        """Parse the settings INI file and report whether it should be rewritten."""
+
+        def process_ini_line_output(line: str) -> str:
+            return line.rstrip('\n')
+
+        validate_file(ini_path)
+
+        ini_data = ini_path.read_text('utf-8')
+
+        need_rewrite_ini = False
+        ini_database: dict[str, str] = {}
+
+        for line in map(process_ini_line_output, ini_data.splitlines(keepends=False)):
+            if (corrected_line := line.strip()) != line:
+                need_rewrite_ini = True
+
+            if not (match := RE_SETTINGS_INI_PARSER_PATTERN.search(corrected_line)):
+                continue
+
+            setting_name = ensure_instance(match.group('key'), str)
+            setting_value = ensure_instance(match.group('value'), str)
+
+            if not (corrected_setting_name := setting_name.strip()):
+                continue
+
+            if corrected_setting_name != setting_name:
+                need_rewrite_ini = True
+
+            if not (corrected_setting_value := setting_value.strip()):
+                continue
+
+            if corrected_setting_value != setting_value:
+                need_rewrite_ini = True
+
+            if corrected_setting_name in ini_database:
+                need_rewrite_ini = True  # Settings file needs to be rewritten as it contains duplicate settings
+                continue
+
+            ini_database[corrected_setting_name] = corrected_setting_value
+
+        return ini_database, need_rewrite_ini
+
+    @classmethod
+    def load_from_settings_file(cls, settings_path: Path) -> None:
+        """Load settings from disk into `Settings` and rewrite when necessary."""
+        try:
+            raw_settings, need_rewrite_settings = cls.parse_settings_ini_file(settings_path)
+        except FileNotFoundError:
+            logger.info('Settings file not found at %s; initializing defaults.', settings_path)
+            need_rewrite_settings = True
+        else:
+            # Build UPPER_CASE defaults dict for the model
+            upper_defaults: dict[str, Any] = {key.upper(): value for key, value in SETTING_DEFAULTS.items()}
+
+            validated, _ini_rewrites, flags = SettingsIniModel.validate_and_get_rewrites(
+                raw_settings,
+                SettingsValidationConfig(
+                    defaults=upper_defaults,
+                    all_setting_names=cls.ALL_SETTINGS,
+                    toggleable_connected_columns=cls.GUI_TOGGLEABLE_CONNECTED_COLUMNS,
+                    toggleable_disconnected_columns=cls.GUI_TOGGLEABLE_DISCONNECTED_COLUMNS,
+                    all_connected_columns=cls.GUI_ALL_CONNECTED_COLUMNS,
+                    all_disconnected_columns=cls.GUI_ALL_DISCONNECTED_COLUMNS,
+                    all_third_party_servers=ALL_THIRD_PARTY_SERVER_NAMES,
+                    max_gui_table_rows_per_page=cls.MAX_GUI_TABLE_ROWS_PER_PAGE,
+                    min_gui_disconnected_players_timer=cls.MIN_GUI_DISCONNECTED_PLAYERS_TIMER_SECONDS,
+                ),
+            )
+
+            # Apply all validated fields to Settings class attrs (UPPER model field → lower class attr)
+            for field_name in cls.ALL_SETTINGS:
+                setattr(cls, field_name.lower(), getattr(validated, field_name))
+
+            if flags.get('should_rewrite'):
+                need_rewrite_settings = True
+
+            if flags.get('invalid_datetime_columns_corrected'):
+                msgbox.show(
+                    title=TITLE,
+                    text=format_triple_quoted_text(format_invalid_datetime_columns_settings_message()),
+                    style=msgbox.Style.MB_OK | msgbox.Style.MB_ICONEXCLAMATION | msgbox.Style.MB_SETFOREGROUND,
+                )
+
+        if need_rewrite_settings:
+            cls.rewrite_settings_file()
