@@ -54,6 +54,7 @@ from session_sniffer.rendering_core.types import CaptureState, GUIRenderingState
 from session_sniffer.settings import Settings
 from session_sniffer.guis.player_leaderboard import PlayerLeaderboardWindow
 from session_sniffer.guis.btx_overlay import OverlayController
+from session_sniffer.guis.btx_whats_new import WhatsNew
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -420,6 +421,12 @@ class MainWindow(LookyMixin, GameMixin, StatsMixin, FilesMixin, QMainWindow):
         help_menu.addAction(discord_action)
 
         help_menu.addSeparator()
+        self._whats_new = WhatsNew(self)
+        whats_new_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'lightbulb.svg')), 'Quoi de neuf', self)
+        whats_new_action.setToolTip('Voir les nouveautés des dernières versions de BTXSniffer')
+        whats_new_action.triggered.connect(self._whats_new.show_now)
+        help_menu.addAction(whats_new_action)
+
         check_updates_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'cloud_download.svg')), 'Vérifier les mises à jour', self)
         check_updates_action.setToolTip('Chercher une nouvelle version de BTXSniffer sur GitHub')
         check_updates_action.triggered.connect(self._check_for_updates)
@@ -505,6 +512,8 @@ class MainWindow(LookyMixin, GameMixin, StatsMixin, FilesMixin, QMainWindow):
 
         # BTX: in-game mini window + global hotkey
         self._overlay_controller = OverlayController(self, self.open_history_search)
+        # BTX: after an update, show the release notes of the new version once
+        QTimer.singleShot(2500, self._whats_new.maybe_show_after_update)
 
         self._connected.section_toggled.connect(self._update_splitter_visibility)
         self._disconnected.section_toggled.connect(self._update_splitter_visibility)

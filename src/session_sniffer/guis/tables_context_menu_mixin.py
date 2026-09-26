@@ -59,6 +59,7 @@ from session_sniffer.settings.settings import Settings
 from session_sniffer.text_utils import pluralize
 from session_sniffer.utils import dedup_preserve_order, run_cmd_script
 from session_sniffer.guis.btx_notes import PlayerNotes, add_tag_menu, edit_player_note
+from session_sniffer.guis.btx_player_card import open_player_card
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -961,6 +962,13 @@ class TableContextMenuMixin(QTableView):
         if len(selected_players) == 1:
             noted_player = selected_players[0]
             has_note = bool(PlayerNotes.get(noted_player.ip))
+            add_action(
+                context_menu,
+                'Fiche joueur…',
+                tooltip='Voir tout l\'historique de ce joueur : nombre de rencontres, temps passé ensemble, dernière rencontre…',
+                handler=lambda: open_player_card(self.window(), noted_player.ip, list(noted_player.usernames), self.viewport().update),
+                icon=QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'player.svg')),
+            )
             add_action(
                 context_menu,
                 'Modifier la note…' if has_note else 'Ajouter une note…',

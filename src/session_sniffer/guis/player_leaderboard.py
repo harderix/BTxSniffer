@@ -94,6 +94,7 @@ from session_sniffer.rendering_core.renderer import SESSIONS_LOGGING_PATH
 from session_sniffer.text_utils import pluralize
 from session_sniffer.guis.i18n import install_translated_header, tr, TrComboBox
 from session_sniffer.guis.btx_notes import TAGS, PlayerNotes, add_tag_menu, edit_player_note, tag_badge, tag_color
+from session_sniffer.guis.btx_player_card import open_player_card
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -935,6 +936,7 @@ class PlayerLeaderboardWindow(ToggleAlwaysOnTopMixin):
         self._table.setSortingEnabled(True)
         self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._show_context_menu)
+        self._table.doubleClicked.connect(self._on_row_double_clicked)  # BTX: double-click = player card
 
         header = setup_table_view_headers(self._table)
         self._table.setItemDelegate(
@@ -1277,6 +1279,13 @@ class PlayerLeaderboardWindow(ToggleAlwaysOnTopMixin):
 
         if len(selected_entries) == 1:
             entry = selected_entries[0]
+            card_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'player.svg')), 'Fiche joueur…', self)
+            card_action.setToolTip("Voir tout l'historique de ce joueur : nombre de rencontres, temps passé ensemble, dernière rencontre…")
+            card_action.triggered.connect(lambda: self._open_player_card(entry))
+            menu.addAction(card_action)
+            menu.setDefaultAction(card_action)
+            menu.addSeparator()
+
             copy_row_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), 'Copier la ligne', self)
             copy_row_action.setShortcut('Ctrl+C')
             copy_row_action.setToolTip('Copier la ligne du joueur sélectionné (texte séparé par tabulations).')
@@ -1444,6 +1453,14 @@ class PlayerLeaderboardWindow(ToggleAlwaysOnTopMixin):
             return
 
         set_clipboard_text('\n'.join(lines))
+
+    def _on_row_double_clicked(self, index: QModelIndex) -> None:
+        source_row = self._proxy.mapToSource(index).row()
+        if 0 <= source_row < len(self._model.entries):
+            self._open_player_card(self._model.entries[source_row])
+
+    def _open_player_card(self, entry: LeaderboardEntry) -> None:
+        open_player_card(self.window(), entry.ip, list(entry.usernames), lambda: (self._proxy.invalidate(), self._table.viewport().update()))
 
     def _show_seen_stats_for_entry(self, entry: LeaderboardEntry) -> None:
         _build_seen_stats_dialog(entry, self).exec()

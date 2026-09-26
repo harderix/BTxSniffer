@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 
 from session_sniffer.constants.local import APP_DIR_ROAMING
 from session_sniffer.guis.btx_notes import PlayerNotes, add_tag_menu, edit_player_note, tag_badge, tag_color
+from session_sniffer.guis.btx_player_card import open_player_card
 from session_sniffer.player.registry import PlayersRegistry
 
 if sys.platform == 'win32':
@@ -417,6 +418,7 @@ class BTXOverlay(QWidget):
         if names:
             menu.addAction(f'Copier le pseudo  ({", ".join(names)})', lambda: clipboard.setText(', '.join(names)))
         menu.addSeparator()
+        menu.addAction('Fiche joueur…', lambda: open_player_card(None, ip, names, self.refresh))
         menu.addAction('Modifier la note…' if PlayerNotes.get(ip) else 'Ajouter une note…', lambda: edit_player_note(self, ip, names) and self.refresh())
         add_tag_menu(menu, ip, names, self.refresh)
         menu.addAction("Chercher dans l'historique", lambda: self._open_history_search(names[0] if names else ip))
