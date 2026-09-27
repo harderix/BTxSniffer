@@ -9,6 +9,7 @@
 import ctypes
 import json
 import sys
+import time
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime
@@ -17,6 +18,7 @@ from typing import Any
 from PySide6.QtCore import QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QGuiApplication, QKeySequence, QMouseEvent, QShortcut
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFrame,
@@ -114,8 +116,49 @@ _SPECIAL_VK: dict[int, int] = {
 }
 
 
+# BTX: mouse buttons can be used as the overlay key (handy when a mod menu grabs the F keys)
+MOUSE_BUTTONS: dict[str, tuple[int, str]] = {
+    'Souris4': (0x05, 'Bouton latéral arrière de la souris (bouton 4)'),
+    'Souris5': (0x06, 'Bouton latéral avant de la souris (bouton 5)'),
+    'SourisMilieu': (0x04, 'Clic molette'),
+}
+
+_VK_NAMES: dict[int, str] = {
+    0x01: 'Clic gauche', 0x02: 'Clic droit', 0x04: 'Clic molette', 0x05: 'Souris 4', 0x06: 'Souris 5',
+    0x08: 'Retour arrière', 0x09: 'Tab', 0x0D: 'Entrée', 0x10: 'Maj', 0x11: 'Ctrl', 0x12: 'Alt', 0x13: 'Pause',
+    0x14: 'Verr. Maj', 0x1B: 'Échap', 0x20: 'Espace', 0x21: 'Page préc.', 0x22: 'Page suiv.', 0x23: 'Fin',
+    0x24: 'Début', 0x25: 'Gauche', 0x26: 'Haut', 0x27: 'Droite', 0x28: 'Bas', 0x2C: 'Impr. écran', 0x2D: 'Inser',
+    0x2E: 'Suppr', 0x5B: 'Windows', 0x5C: 'Windows', 0x5D: 'Menu', 0x90: 'Verr. Num', 0x91: 'Arrêt défil',
+}
+_VK_IGNORED = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}  # left/right variants of Shift/Ctrl/Alt (generic ones are shown)
+
+
+def vk_name(vk: int) -> str:
+    """Human-readable name of a Windows virtual key."""
+    if vk in _VK_NAMES:
+        return _VK_NAMES[vk]
+    if 0x70 <= vk <= 0x87:
+        return f'F{vk - 0x6F}'
+    if 0x30 <= vk <= 0x39 or 0x41 <= vk <= 0x5A:
+        return chr(vk)
+    if 0x60 <= vk <= 0x69:
+        return f'Pavé num. {vk - 0x60}'
+    if 0xAD <= vk <= 0xB7:
+        return 'Touche multimédia (son/lecture)'
+    return f'Touche 0x{vk:02X}'
+
+
+def display_hotkey(sequence_text: str) -> str:
+    """Text shown to the user for a saved hotkey."""
+    if sequence_text in MOUSE_BUTTONS:
+        return MOUSE_BUTTONS[sequence_text][1]
+    return QKeySequence(sequence_text).toString(QKeySequence.SequenceFormat.NativeText) or sequence_text
+
+
 def _sequence_to_win32(sequence_text: str) -> tuple[int, int] | None:
     """Convert a Qt key sequence string (e.g. 'Ctrl+F8') to Win32 (modifiers, virtual key)."""
+    if sequence_text in MOUSE_BUTTONS:
+        return _MOD_NOREPEAT, MOUSE_BUTTONS[sequence_text][0]
     sequence = QKeySequence(sequence_text)
     if sequence.isEmpty():
         return None
@@ -139,13 +182,90 @@ def _sequence_to_win32(sequence_text: str) -> tuple[int, int] | None:
     return (win_mods, vk) if vk is not None else None
 
 
+_GAME_EXES = {'gta5.exe', 'gta5_enhanced.exe', 'playgtav.exe'}
+
+
+def is_running_as_admin() -> bool:
+    """True when BTXSniffer runs elevated (always True outside Windows)."""
+    if sys.platform != 'win32':
+        return True
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+    except (OSError, AttributeError):
+        return True
+
+
+def elevated_game_in_foreground() -> bool:
+    """True when the foreground window is GTA V running with higher rights than BTXSniffer.
+
+    Windows then hides the keyboard from non-elevated programs (UIPI), so the overlay key cannot work.
+    """
+    if sys.platform != 'win32':
+        return False
+    try:
+        from ctypes import wintypes  # noqa: PLC0415
+
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        advapi32 = ctypes.windll.advapi32  # type: ignore[attr-defined]
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            size = wintypes.DWORD(1024)
+            buffer = ctypes.create_unicode_buffer(1024)
+            if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                return False
+            if buffer.value.replace('/', '\\').rsplit('\\', 1)[-1].lower() not in _GAME_EXES:
+                return False
+            token = wintypes.HANDLE()
+            if not advapi32.OpenProcessToken(handle, 0x0008, ctypes.byref(token)):  # TOKEN_QUERY
+                return True  # access denied -> the game runs with higher rights than us
+            try:
+                elevation = wintypes.DWORD()
+                returned = wintypes.DWORD()
+                ok = advapi32.GetTokenInformation(token, 20, ctypes.byref(elevation), 4, ctypes.byref(returned))  # TokenElevation
+                return bool(ok and elevation.value)
+            finally:
+                kernel32.CloseHandle(token)
+        finally:
+            kernel32.CloseHandle(handle)
+    except (OSError, AttributeError, ValueError):
+        return False
+
+
+def relaunch_as_admin(window: QWidget) -> bool:
+    """Start BTXSniffer again with administrator rights and close this instance."""
+    if sys.platform != 'win32':
+        return False
+    if getattr(sys, 'frozen', False):
+        program, params = sys.executable, ' '.join(f'"{a}"' for a in sys.argv[1:])
+    else:
+        program, params = sys.executable, ' '.join(f'"{a}"' for a in sys.orig_argv[1:])
+    try:
+        result = ctypes.windll.shell32.ShellExecuteW(None, 'runas', program, params, None, 1)  # type: ignore[attr-defined]
+    except (OSError, AttributeError):
+        return False
+    if result <= 32:  # noqa: PLR2004 - ShellExecute error codes (user refused the admin prompt, ...)
+        return False
+    window.close()
+    return True
+
+
 class GlobalHotkey(QWidget):
     """System-wide hotkey.
 
-    BTX: on Windows the key is detected by polling the keyboard state (GetAsyncKeyState) instead of
-    RegisterHotKey. RegisterHotKey silently fails when another program (mod menu, Discord, NVIDIA/AMD
-    overlay, OBS...) already uses the same key; polling keeps working in every case, in borderless
-    full-screen games too. Other platforms use an in-app shortcut.
+    BTX: on Windows two detectors run together (a press is counted once):
+    - RegisterHotKey (Windows hotkey), which works even when the game runs with higher rights;
+    - polling of the keyboard state (GetAsyncKeyState), which works even when another program
+      (mod menu, Discord, NVIDIA/AMD overlay, OBS...) already registered the same key.
+    Other platforms use an in-app shortcut.
     """
 
     activated = Signal()
@@ -164,6 +284,10 @@ class GlobalHotkey(QWidget):
         self._timer = QTimer(self)
         self._timer.setInterval(self._POLL_MS)
         self._timer.timeout.connect(self._poll)
+        self._registered = False
+        self._last_fire = 0.0
+        if sys.platform == 'win32':
+            self.winId()  # native window that receives WM_HOTKEY
 
     def set_sequence(self, sequence_text: str) -> bool:
         """(Re)bind the hotkey. Returns False if the key cannot be used."""
@@ -177,6 +301,11 @@ class GlobalHotkey(QWidget):
             self._mods, self._vk = converted[0] & ~_MOD_NOREPEAT, converted[1]
             self._was_down = self._is_down()  # ignore a key already held when (re)binding
             self._timer.start()
+            if sequence_text not in MOUSE_BUTTONS:  # RegisterHotKey only handles keyboard keys
+                with suppress(OSError, AttributeError):
+                    self._registered = bool(
+                        ctypes.windll.user32.RegisterHotKey(int(self.winId()), _HOTKEY_ID, converted[0], converted[1]),  # type: ignore[attr-defined]
+                    )
             return True
         self._fallback_shortcut = QShortcut(QKeySequence(sequence_text), self._fallback_parent)
         self._fallback_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
@@ -192,6 +321,10 @@ class GlobalHotkey(QWidget):
         """Release the current hotkey, if any."""
         self._timer.stop()
         self._vk = None
+        if self._registered:
+            with suppress(OSError, AttributeError):
+                ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _HOTKEY_ID)  # type: ignore[attr-defined]
+            self._registered = False
         if self._fallback_shortcut is not None:
             self._fallback_shortcut.setEnabled(False)
             self._fallback_shortcut.deleteLater()
@@ -222,9 +355,28 @@ class GlobalHotkey(QWidget):
             down = self._is_down()
         except (OSError, AttributeError):
             return
-        if down and not self._was_down and not self._paused and self._mods_match():
-            self.activated.emit()
+        if down and not self._was_down and self._mods_match():
+            self._fire()
         self._was_down = down
+
+    def _fire(self) -> None:
+        """Emit once per key press, whichever detector saw it first."""
+        if self._paused:
+            return
+        now = time.monotonic()
+        if now - self._last_fire < 0.35:  # noqa: PLR2004
+            return
+        self._last_fire = now
+        self.activated.emit()
+
+    def nativeEvent(self, event_type: Any, message: Any) -> tuple[bool, int]:  # noqa: ANN401, N802  # pylint: disable=invalid-name
+        """Catch WM_HOTKEY (Windows hotkey detector)."""
+        if sys.platform == 'win32' and event_type == b'windows_generic_MSG':
+            msg = ctypes.wintypes.MSG.from_address(int(message))
+            if msg.message == _WM_HOTKEY and msg.wParam == _HOTKEY_ID:
+                self._fire()
+                return True, 0
+        return super().nativeEvent(event_type, message)
 
 
 # ----------------------------------------------------------------------------
@@ -520,7 +672,8 @@ class OverlaySettingsDialog(QDialog):
 
         info = QLabel(
             'Clique dans le champ puis appuie sur la touche (ou la combinaison) de ton choix.\n'
-            'Exemples : F8, Ctrl+F9, Alt+B.\n\n'
+            'Exemples : F8, Ctrl+F9, Alt+B, Inser.\n'
+            'Tu peux aussi utiliser un bouton de souris (pratique si ton mod menu bloque les touches F).\n\n'
             "Astuce : mets ton jeu en « Plein écran fenêtré » (borderless) pour que la mini-fenêtre s'affiche par-dessus.",
         )
         info.setWordWrap(True)
@@ -528,13 +681,53 @@ class OverlaySettingsDialog(QDialog):
 
         row = QHBoxLayout()
         row.addWidget(QLabel('Raccourci :'))
-        self._editor = QKeySequenceEdit(QKeySequence(current_hotkey))
+        self._editor = QKeySequenceEdit(QKeySequence('' if current_hotkey in MOUSE_BUTTONS else current_hotkey))
         self._editor.setMaximumSequenceLength(1)
         row.addWidget(self._editor, 1)
         clear_button = QPushButton('Effacer')
         clear_button.clicked.connect(self._editor.clear)
         row.addWidget(clear_button)
         layout.addLayout(row)
+
+        mouse_row = QHBoxLayout()
+        mouse_row.addWidget(QLabel('Ou souris :'))
+        self._mouse = QComboBox()
+        self._mouse.addItem('Aucun (utiliser la touche ci-dessus)', '')
+        for key, (_vk, label) in MOUSE_BUTTONS.items():
+            self._mouse.addItem(label, key)
+        if current_hotkey in MOUSE_BUTTONS:
+            self._mouse.setCurrentIndex(self._mouse.findData(current_hotkey))
+        mouse_row.addWidget(self._mouse, 1)
+        layout.addLayout(mouse_row)
+        self._editor.keySequenceChanged.connect(lambda seq: (not seq.isEmpty()) and self._mouse.setCurrentIndex(0))
+        self._mouse.currentIndexChanged.connect(lambda i: i > 0 and self._editor.clear())
+
+        # Live key tester: shows what Windows really receives from the keyboard / mouse
+        self._tester = QLabel()
+        self._tester.setWordWrap(True)
+        self._tester.setMinimumHeight(52)
+        self._tester.setStyleSheet('padding: 8px; border: 1px dashed rgba(63, 240, 255, 0.5); border-radius: 6px;')
+        layout.addWidget(QLabel('<b>Test :</b> appuie sur ta touche, elle doit apparaître ici.'))
+        layout.addWidget(self._tester)
+        if sys.platform == 'win32' and not is_running_as_admin():
+            admin_row = QHBoxLayout()
+            admin_info = QLabel('Ça marche partout sauf en jeu ? Si GTA est lancé en administrateur, BTXSniffer doit l\'être aussi.')
+            admin_info.setWordWrap(True)
+            admin_button = QPushButton('Relancer en administrateur')
+            admin_button.clicked.connect(lambda: relaunch_as_admin(self.parentWidget() or self))
+            admin_row.addWidget(admin_info, 1)
+            admin_row.addWidget(admin_button)
+            layout.addLayout(admin_row)
+        self._seen_keys: list[str] = []
+        self._shortcut_seen = False
+        self._test_timer = QTimer(self)
+        self._test_timer.setInterval(40)
+        self._test_timer.timeout.connect(self._poll_test)
+        if sys.platform == 'win32':
+            self._tester.setText('En attente… (appuie sur une touche)')
+            self._test_timer.start()
+        else:
+            self._tester.setText('Le test des touches est disponible sous Windows.')
 
         opacity_row = QHBoxLayout()
         opacity_row.addWidget(QLabel('Opacité :'))
@@ -553,10 +746,40 @@ class OverlaySettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self.setMinimumWidth(520)
+        self.setMinimumHeight(layout.heightForWidth(520) if layout.hasHeightForWidth() else 0)
+        self.adjustSize()
 
     def hotkey(self) -> str:
-        """Return the chosen shortcut as portable text (e.g. 'Ctrl+F8')."""
+        """Return the chosen shortcut as portable text (e.g. 'Ctrl+F8' or 'Souris4')."""
+        mouse = self._mouse.currentData()
+        if mouse:
+            return str(mouse)
         return self._editor.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
+
+    def _poll_test(self) -> None:
+        """Show which keys Windows currently sees as pressed, and whether the chosen shortcut matches."""
+        try:
+            get_state = ctypes.windll.user32.GetAsyncKeyState  # type: ignore[attr-defined]
+            down = [vk for vk in range(1, 255) if vk not in _VK_IGNORED and get_state(vk) & 0x8000]
+        except (OSError, AttributeError):
+            return
+        names = [vk_name(vk) for vk in down if vk not in (0x01,)]  # left click is used to click in this window
+        if names:
+            combo = ' + '.join(names)
+            if not self._seen_keys or self._seen_keys[-1] != combo:
+                self._seen_keys = [*self._seen_keys[-3:], combo]
+            converted = _sequence_to_win32(self.hotkey())
+            if converted is not None and converted[1] in down:
+                self._shortcut_seen = True
+        lines = [f'Dernières touches reçues par Windows : {" | ".join(self._seen_keys)}' if self._seen_keys else 'En attente… (appuie sur une touche)']
+        if self._shortcut_seen:
+            lines.append(f'✅ Ton raccourci ({display_hotkey(self.hotkey())}) est bien détecté.')
+        elif self._seen_keys:
+            lines.append(
+                "Si ta touche n'apparaît pas : essaie avec Fn (PC portable), ou choisis une autre touche / un bouton de souris.",
+            )
+        self._tester.setText('\n'.join(lines))
 
     def opacity(self) -> int:
         """Return the chosen opacity percentage."""
@@ -573,10 +796,44 @@ class OverlayController:
         self._hotkey = GlobalHotkey(main_window)
         self._hotkey.activated.connect(self.overlay.toggle)
         self._apply_hotkey(load_overlay_config()['hotkey'])
+        # BTX: warn (once) when GTA runs as administrator but BTXSniffer does not -> keys are invisible to us
+        self._admin_warned = False
+        self._admin_timer = QTimer(main_window)
+        self._admin_timer.setInterval(3000)
+        self._admin_timer.timeout.connect(self._check_game_rights)
+        if sys.platform == 'win32' and not is_running_as_admin():
+            self._admin_timer.start()
+
+    def _check_game_rights(self) -> None:
+        if self._admin_warned or not elevated_game_in_foreground():
+            return
+        self._admin_warned = True
+        self._admin_timer.stop()
+        QTimer.singleShot(0, self._warn_game_is_admin)
+
+    def _warn_game_is_admin(self) -> None:
+        from PySide6.QtWidgets import QMessageBox  # noqa: PLC0415
+
+        box = QMessageBox(self._main_window)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle('Mini-fenêtre en jeu')
+        box.setText(
+            'GTA est lancé en administrateur, mais pas BTXSniffer.\n\n'
+            'Windows empêche alors BTXSniffer de voir tes touches pendant que tu joues : '
+            'le raccourci de la mini-fenêtre ne peut pas marcher.\n\n'
+            'Solution : relancer BTXSniffer en administrateur.',
+        )
+        relaunch = box.addButton('Relancer en administrateur', QMessageBox.ButtonRole.AcceptRole)
+        box.addButton('Plus tard', QMessageBox.ButtonRole.RejectRole)
+        box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on=True)
+        box.exec()
+        if box.clickedButton() is relaunch and not relaunch_as_admin(self._main_window):
+            QMessageBox.warning(self._main_window, 'Mini-fenêtre en jeu', "Le relancement en administrateur a été annulé ou a échoué.")
 
     def _apply_hotkey(self, sequence_text: str) -> bool:
         ok = self._hotkey.set_sequence(sequence_text)
-        self.overlay.set_hotkey_hint(sequence_text if ok else '')
+        short = {'Souris4': 'Souris 4', 'Souris5': 'Souris 5', 'SourisMilieu': 'Clic molette'}
+        self.overlay.set_hotkey_hint(short.get(sequence_text) or display_hotkey(sequence_text) if ok and sequence_text else '')
         return ok
 
     def toggle(self) -> None:
@@ -613,6 +870,7 @@ class OverlayController:
 
     def shutdown(self) -> None:
         """Release the hotkey and close the overlay."""
+        self._admin_timer.stop()
         self._hotkey.unregister()
         self.overlay.close()
         self._hotkey.close()
