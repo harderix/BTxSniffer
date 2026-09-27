@@ -140,22 +140,33 @@ def _sequence_to_win32(sequence_text: str) -> tuple[int, int] | None:
 
 
 class GlobalHotkey(QWidget):
-    """Register a system-wide hotkey (Windows) or an in-app shortcut (other platforms)."""
+    """System-wide hotkey.
+
+    BTX: on Windows the key is detected by polling the keyboard state (GetAsyncKeyState) instead of
+    RegisterHotKey. RegisterHotKey silently fails when another program (mod menu, Discord, NVIDIA/AMD
+    overlay, OBS...) already uses the same key; polling keeps working in every case, in borderless
+    full-screen games too. Other platforms use an in-app shortcut.
+    """
 
     activated = Signal()
+    _POLL_MS = 25
 
     def __init__(self, fallback_parent: QWidget) -> None:
-        """Create the hidden native window that receives WM_HOTKEY messages."""
+        """Create the (never shown) helper widget."""
         super().__init__(None)
         self.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)  # noqa: FBT003
-        self._registered = False
         self._fallback_parent = fallback_parent
         self._fallback_shortcut: QShortcut | None = None
-        if sys.platform == 'win32':
-            self.winId()  # force creation of a native HWND even though the widget is never shown
+        self._vk: int | None = None
+        self._mods = 0
+        self._was_down = False
+        self._paused = False
+        self._timer = QTimer(self)
+        self._timer.setInterval(self._POLL_MS)
+        self._timer.timeout.connect(self._poll)
 
     def set_sequence(self, sequence_text: str) -> bool:
-        """(Re)bind the hotkey. Returns False if the key could not be registered."""
+        """(Re)bind the hotkey. Returns False if the key cannot be used."""
         self.unregister()
         if not sequence_text:
             return True
@@ -163,33 +174,57 @@ class GlobalHotkey(QWidget):
             converted = _sequence_to_win32(sequence_text)
             if converted is None:
                 return False
-            modifiers, vk = converted
-            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
-            self._registered = bool(user32.RegisterHotKey(int(self.winId()), _HOTKEY_ID, modifiers, vk))
-            return self._registered
+            self._mods, self._vk = converted[0] & ~_MOD_NOREPEAT, converted[1]
+            self._was_down = self._is_down()  # ignore a key already held when (re)binding
+            self._timer.start()
+            return True
         self._fallback_shortcut = QShortcut(QKeySequence(sequence_text), self._fallback_parent)
         self._fallback_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self._fallback_shortcut.activated.connect(self.activated.emit)
         return True
 
+    def set_paused(self, paused: bool) -> None:  # noqa: FBT001
+        """Temporarily ignore the key (e.g. while choosing a new one)."""
+        self._paused = paused
+        self._was_down = True  # require a fresh press after resuming
+
     def unregister(self) -> None:
         """Release the current hotkey, if any."""
-        if self._registered and sys.platform == 'win32':
-            ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _HOTKEY_ID)  # type: ignore[attr-defined]
-        self._registered = False
+        self._timer.stop()
+        self._vk = None
         if self._fallback_shortcut is not None:
             self._fallback_shortcut.setEnabled(False)
             self._fallback_shortcut.deleteLater()
             self._fallback_shortcut = None
 
-    def nativeEvent(self, event_type: Any, message: Any) -> tuple[bool, int]:  # noqa: ANN401, N802  # pylint: disable=invalid-name
-        """Catch WM_HOTKEY on Windows."""
-        if sys.platform == 'win32' and event_type == b'windows_generic_MSG':
-            msg = ctypes.wintypes.MSG.from_address(int(message))
-            if msg.message == _WM_HOTKEY and msg.wParam == _HOTKEY_ID:
-                self.activated.emit()
-                return True, 0
-        return super().nativeEvent(event_type, message)
+    @staticmethod
+    def _key_down(vk: int) -> bool:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)  # type: ignore[attr-defined]
+
+    def _mods_match(self) -> bool:
+        wanted = {
+            _MOD_CONTROL: (0x11,),  # VK_CONTROL
+            _MOD_ALT: (0x12,),  # VK_MENU
+            _MOD_SHIFT: (0x10,),  # VK_SHIFT
+            _MOD_WIN: (0x5B, 0x5C),  # VK_LWIN / VK_RWIN
+        }
+        for flag, keys in wanted.items():
+            down = any(self._key_down(k) for k in keys)
+            if down != bool(self._mods & flag):
+                return False
+        return True
+
+    def _is_down(self) -> bool:
+        return self._vk is not None and self._key_down(self._vk)
+
+    def _poll(self) -> None:
+        try:
+            down = self._is_down()
+        except (OSError, AttributeError):
+            return
+        if down and not self._was_down and not self._paused and self._mods_match():
+            self.activated.emit()
+        self._was_down = down
 
 
 # ----------------------------------------------------------------------------
@@ -552,7 +587,12 @@ class OverlayController:
         """Open the hotkey/opacity dialog and apply the result."""
         config = load_overlay_config()
         dialog = OverlaySettingsDialog(self._main_window, str(config['hotkey']), int(config['opacity']))
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        self._hotkey.set_paused(True)
+        try:
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            self._hotkey.set_paused(False)
+        if not accepted:
             return
         new_hotkey = dialog.hotkey()
         if not self._apply_hotkey(new_hotkey):
@@ -562,7 +602,7 @@ class OverlayController:
                 self._main_window,
                 'Raccourci indisponible',
                 f'Impossible d\'utiliser « {new_hotkey} ».\n\n'
-                "Cette touche est peut-être déjà utilisée par une autre application. Choisis-en une autre (ex. F8, Ctrl+F9).",
+                'Cette touche n\'est pas prise en charge. Choisis une touche F1-F12, une lettre, un chiffre ou une combinaison (ex. F8, Ctrl+F9).',
             )
             self._apply_hotkey(str(config['hotkey']))
             return
