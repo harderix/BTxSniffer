@@ -54,6 +54,7 @@ from session_sniffer.rendering_core.types import CaptureState, GUIRenderingState
 from session_sniffer.settings import Settings
 from session_sniffer.guis.player_leaderboard import PlayerLeaderboardWindow
 from session_sniffer.guis.btx_overlay import OverlayController
+from session_sniffer.guis.btx_extras_menu import add_backup_menu, add_theme_menu
 from session_sniffer.guis.btx_whats_new import WhatsNew
 
 if TYPE_CHECKING:
@@ -309,6 +310,9 @@ class MainWindow(LookyMixin, GameMixin, StatsMixin, FilesMixin, QMainWindow):
             raise RuntimeError(message)
         data_menu.setToolTipsVisible(True)
 
+        add_backup_menu(data_menu, self)  # BTX: backups / export / import of notes and tags
+        data_menu.addSeparator()
+
         open_local_appdata_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'folder.svg')), 'Ouvrir le dossier AppData Local', self)
         open_local_appdata_action.setToolTip("Ouvrir AppData\\Local\\Session Sniffer dans l'explorateur Windows")
         open_local_appdata_action.triggered.connect(self._open_local_appdata_folder)
@@ -408,6 +412,7 @@ class MainWindow(LookyMixin, GameMixin, StatsMixin, FilesMixin, QMainWindow):
         open_settings_action.setToolTip("Voir et modifier tous les paramètres de l'application")
         open_settings_action.triggered.connect(self._open_settings_dialog)
         settings_menu.addAction(open_settings_action)
+        add_theme_menu(settings_menu, self)  # BTX: colour themes
 
         help_menu = menu_bar.addMenu('Aide')
         if not help_menu:
