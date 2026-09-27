@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import aiohttp.web
 
-from session_sniffer.constants.standalone import GITHUB_ISSUES_URL
+from session_sniffer.constants.standalone import DISCORD_INVITE_URL
 from session_sniffer.core import ExceptionInfo, terminate_script
 from session_sniffer.rendering_core.types import GUIRenderingSnapshot, GUIRenderingState
 
@@ -42,7 +42,7 @@ def _handle_asyncio_exception(_loop: asyncio.AbstractEventLoop, context: dict[st
         return
     terminate_script(
         'THREAD_RAISED',
-        f'An unexpected (uncaught) error occurred.\n\nPlease kindly report it to:\n{GITHUB_ISSUES_URL}',
+        f'Une erreur inattendue est survenue et BTXSniffer doit se fermer.\n\nSignale-la sur le Discord BTX (avec le fichier crash.log) :\n{DISCORD_INVITE_URL}',
         exception_info=ExceptionInfo(type(exc), exc, exc.__traceback__),
     )
 

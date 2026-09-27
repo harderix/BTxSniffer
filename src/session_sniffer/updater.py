@@ -257,9 +257,28 @@ def _apply_update(new_exe: Path) -> None:
         env={**os.environ, 'PYINSTALLER_RESET_ENVIRONMENT': '1'},
         close_fds=True,
     )
-    # os._exit bypasses atexit handlers and Qt/thread teardown, which is intentional:
-    # background threads (capture, rendering, etc.) are still running at this point,
-    # and sys.exit would attempt a full teardown after the exe has already been replaced.
+    # Quit immediately without any teardown: background threads (capture, rendering, etc.) are still
+    # running and the exe has already been replaced.
+    _hard_exit()
+
+
+def _hard_exit() -> None:
+    """Kill the current process right now.
+
+    BTX: on Windows, os._exit() still runs the DLL unload routines (ExitProcess), which destroys Qt objects
+    and calls back into Python while the interpreter is going away -> "unexpected error" box and access
+    violation after an update. TerminateProcess stops the process without running any of that.
+    """
+    if sys.platform == 'win32':
+        try:
+            import ctypes  # noqa: PLC0415
+
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            kernel32.TerminateProcess.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+            kernel32.TerminateProcess(kernel32.GetCurrentProcess(), 0)
+        except (OSError, AttributeError):
+            pass
     os._exit(0)
 
 

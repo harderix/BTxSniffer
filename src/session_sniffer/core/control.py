@@ -10,7 +10,7 @@ from types import TracebackType
 from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple
 
 from session_sniffer import msgbox
-from session_sniffer.constants.standalone import GITHUB_ISSUES_URL, TITLE
+from session_sniffer.constants.standalone import DISCORD_INVITE_URL, TITLE
 from session_sniffer.gta5.suspend_manager import GTASuspendManager
 from session_sniffer.utils import terminate_process_tree
 
@@ -92,7 +92,7 @@ def handle_exception(exc_type: type[BaseException], exc_value: BaseException, ex
     exception_info = ExceptionInfo(exc_type, exc_value, exc_traceback)
     terminate_script(
         'EXIT',
-        f'An unexpected (uncaught) error occurred.\n\nPlease kindly report it to:\n{GITHUB_ISSUES_URL}',
+        f'Une erreur inattendue est survenue et BTXSniffer doit se fermer.\n\nSignale-la sur le Discord BTX (avec le fichier crash.log) :\n{DISCORD_INVITE_URL}',
         exception_info=exception_info,
     )
 
@@ -113,7 +113,7 @@ def terminate_on_uncaught_exception(exc: BaseException) -> None:
     """
     terminate_script(
         'THREAD_RAISED',
-        f'An unexpected (uncaught) error occurred.\n\nPlease kindly report it to:\n{GITHUB_ISSUES_URL}',
+        f'Une erreur inattendue est survenue et BTXSniffer doit se fermer.\n\nSignale-la sur le Discord BTX (avec le fichier crash.log) :\n{DISCORD_INVITE_URL}',
         exception_info=ExceptionInfo(type(exc), exc, exc.__traceback__),
     )
 
@@ -127,7 +127,7 @@ def _handle_thread_exception(args: threading.ExceptHookArgs) -> None:
     exception_info = ExceptionInfo(args.exc_type, exc_value, args.exc_traceback)
     terminate_script(
         'THREAD_RAISED',
-        (f'An unexpected (uncaught) error occurred.\n\nPlease kindly report it to:\n{GITHUB_ISSUES_URL}'),
+        (f'Une erreur inattendue est survenue et BTXSniffer doit se fermer.\n\nSignale-la sur le Discord BTX (avec le fichier crash.log) :\n{DISCORD_INVITE_URL}'),
         exception_info=exception_info,
     )
 
