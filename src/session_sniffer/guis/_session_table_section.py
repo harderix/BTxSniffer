@@ -517,7 +517,7 @@ class SessionTableSection(QWidget):
         self.table_view.setup_static_column_resizing()
         self.table_model.view = self.table_view
 
-        search_shortcut = QShortcut(QKeySequence('Ctrl+F'), self.table_view)
+        search_shortcut = QShortcut(QKeySequence('Ctrl+Shift+F'), self.table_view)  # BTX: Ctrl+F = global player search
         search_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         search_shortcut.activated.connect(self._search_bar.setFocus)
 

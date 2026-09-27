@@ -156,23 +156,64 @@ class PlayerNotes:
         return False
 
     @classmethod
+    def _key(cls, ip: str) -> str:
+        """IP under which the note of *ip* is stored (linked IPs share one note / tag)."""
+        members = PlayerLinks.group_of(ip)
+        if len(members) == 1:
+            return ip
+        notes = cls._load()
+        return next((member for member in members if member in notes), members[0])
+
+    @classmethod
     def get(cls, ip: str) -> str:
         """Return the note for *ip*, or an empty string."""
         with cls._lock:
-            entry = cls._load().get(ip)
+            entry = cls._load().get(cls._key(ip))
             return entry['note'] if entry else ''
 
     @classmethod
     def get_tag(cls, ip: str) -> str:
         """Return the tag key ('ami', 'dangereux', 'relou') for *ip*, or an empty string."""
         with cls._lock:
-            entry = cls._load().get(ip)
+            entry = cls._load().get(cls._key(ip))
             return entry.get('tag', '') if entry else ''
+
+    @classmethod
+    def merge_group(cls, members: list[str]) -> None:
+        """Linked IPs: keep a single note / tag for the whole group."""
+        with cls._lock:
+            notes = cls._load()
+            entries = [(ip, notes[ip]) for ip in members if ip in notes]
+            if len(entries) < 2:  # noqa: PLR2004
+                return
+            primary_ip, primary = entries[0]
+            texts = [primary.get('note', '')]
+            names = [n for n in primary.get('names', '').split(', ') if n]
+            for ip, entry in entries[1:]:
+                if entry.get('note') and entry['note'] not in texts:
+                    texts.append(entry['note'])
+                if not primary.get('tag') and entry.get('tag'):
+                    primary['tag'] = entry['tag']
+                names += [n for n in entry.get('names', '').split(', ') if n and n not in names]
+                notes.pop(ip, None)
+            primary['note'] = '\n'.join(t for t in texts if t)[:MAX_NOTE_LENGTH]
+            primary['names'] = ', '.join(names)
+            notes[primary_ip] = primary
+            cls._save()
+
+    @classmethod
+    def move_entry(cls, from_ip: str, to_ip: str) -> None:
+        with cls._lock:
+            notes = cls._load()
+            if from_ip in notes and to_ip not in notes:
+                notes[to_ip] = notes.pop(from_ip)
+                cls._save()
 
     @classmethod
     def _update(cls, ip: str, names: list[str] | None, **fields: str) -> None:
         with cls._lock:
             notes = cls._load()
+            ip = cls._key(ip)
             entry = notes.get(ip, {'note': '', 'tag': '', 'names': '', 'updated': ''})
             entry.update(fields)
             if names:
@@ -198,7 +239,7 @@ class PlayerNotes:
     def search_text(cls, ip: str) -> str:
         """Return note + tag label, lowercase, for search matching."""
         with cls._lock:
-            entry = cls._load().get(ip)
+            entry = cls._load().get(cls._key(ip))
         if not entry:
             return ''
         tag = TAGS.get(entry.get('tag', ''), ('', '', ''))[0]
@@ -211,6 +252,79 @@ class PlayerNotes:
         with cls._lock:
             ips = list(cls._load())
         return [ip for ip in ips if text in cls.search_text(ip)]
+
+
+LINKS_PATH = APP_DIR_ROAMING / 'btx_player_links.json'
+
+
+class PlayerLinks:
+    """Groups of IP addresses that belong to the same player (new box, VPN...)."""
+
+    _lock = threading.RLock()
+    _groups: list[list[str]] | None = None
+
+    @classmethod
+    def _load(cls) -> list[list[str]]:
+        if cls._groups is None:
+            cls._groups = []
+            with suppress(OSError, ValueError, TypeError):
+                data = json.loads(LINKS_PATH.read_text(encoding='utf-8'))
+                groups = data.get('groups', []) if isinstance(data, dict) else []
+                seen: set[str] = set()
+                for group in groups:
+                    if isinstance(group, list):
+                        clean = [str(ip) for ip in group if str(ip) not in seen]
+                        seen.update(clean)
+                        if len(clean) > 1:
+                            cls._groups.append(clean)
+        return cls._groups
+
+    @classmethod
+    def _save(cls) -> None:
+        with suppress(OSError):
+            LINKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = LINKS_PATH.with_suffix('.tmp')
+            tmp.write_text(json.dumps({'groups': cls._load()}, ensure_ascii=False, indent=2), encoding='utf-8')
+            os.replace(tmp, LINKS_PATH)
+
+    @classmethod
+    def group_of(cls, ip: str) -> list[str]:
+        """All IPs of the player that owns *ip* (just [ip] when not linked)."""
+        with cls._lock:
+            for group in cls._load():
+                if ip in group:
+                    return list(group)
+        return [ip]
+
+    @classmethod
+    def link(cls, ip_a: str, ip_b: str) -> list[str]:
+        """Declare that *ip_a* and *ip_b* are the same player. Returns the resulting group."""
+        with cls._lock:
+            groups = cls._load()
+            group_a = next((g for g in groups if ip_a in g), None)
+            group_b = next((g for g in groups if ip_b in g), None)
+            if group_a is not None and group_a is group_b:
+                return list(group_a)
+            merged = list(group_a or [ip_a])
+            merged += [ip for ip in (group_b or [ip_b]) if ip not in merged]
+            cls._groups = [g for g in groups if g is not group_a and g is not group_b] + [merged]
+            cls._save()
+        PlayerNotes.merge_group(merged)
+        return list(merged)
+
+    @classmethod
+    def unlink(cls, ip: str) -> None:
+        """Remove *ip* from its group (its note / tag stays with the rest of the group)."""
+        with cls._lock:
+            groups = cls._load()
+            group = next((g for g in groups if ip in g), None)
+            if group is None:
+                return
+            remaining = [member for member in group if member != ip]
+            cls._groups = [g for g in groups if g is not group] + ([remaining] if len(remaining) > 1 else [])
+            cls._save()
+        if remaining:
+            PlayerNotes.move_entry(ip, remaining[0])
 
 
 def tag_color(ip: str) -> str | None:

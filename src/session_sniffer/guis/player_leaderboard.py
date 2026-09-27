@@ -866,7 +866,7 @@ class PlayerLeaderboardWindow(ToggleAlwaysOnTopMixin):
 
         layout.addLayout(controls_layout)
 
-        search_shortcut = QShortcut(QKeySequence('Ctrl+F'), self)
+        search_shortcut = QShortcut(QKeySequence('Ctrl+Shift+F'), self)  # BTX: Ctrl+F = global player search
         search_shortcut.activated.connect(self._search_box.setFocus)
 
         # Second controls row: filters and actions

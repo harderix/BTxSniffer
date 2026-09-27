@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 from session_sniffer.constants.local import APP_DIR_ROAMING
 from session_sniffer.guis.btx_notes import PlayerNotes, add_tag_menu, edit_player_note, tag_badge, tag_color
 from session_sniffer.guis.btx_player_card import open_player_card
+from session_sniffer.guis.btx_search import PlayerIndex, result_text, search_players, tag_rank
 from session_sniffer.player.registry import PlayersRegistry
 
 if sys.platform == 'win32':
@@ -448,7 +449,7 @@ class BTXOverlay(QWidget):
         layout.addLayout(header)
 
         self._search = QLineEdit()
-        self._search.setPlaceholderText('Chercher un joueur (pseudo, IP, pays, note)…')
+        self._search.setPlaceholderText('Chercher un joueur (pseudo, IP, note, étiquette)… Ctrl+F')
         self._search.setClearButtonEnabled(True)
         self._search.textChanged.connect(self.refresh)
         self._search.returnPressed.connect(self._search_in_history)
@@ -463,8 +464,15 @@ class BTXOverlay(QWidget):
         self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._show_player_menu)
-        self._list.setToolTip('Clic droit sur un joueur pour copier son IP, son port ou son pseudo')
+        self._list.itemDoubleClicked.connect(self._open_card_for_item)
+        self._list.setToolTip('Clic droit : copier IP / port / pseudo, note, étiquette…  ·  Double-clic : fiche du joueur')
         layout.addWidget(self._list)
+
+        # BTX: Ctrl+F in the mini window = focus the search (session + history)
+        find_shortcut = QShortcut(QKeySequence('Ctrl+F'), self)
+        find_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        find_shortcut.activated.connect(lambda: (self._search.setFocus(), self._search.selectAll()))
+        PlayerIndex._signals().updated.connect(self._on_index_updated)  # noqa: SLF001
         self._previous_foreground: int | None = None
 
         footer = QHBoxLayout()
@@ -544,16 +552,21 @@ class BTXOverlay(QWidget):
 
         text = self._search.text().strip().lower()
         self._list.clear()
+        history_results = []
         if text:
-            self._section_label.setText('RÉSULTATS (CETTE SESSION)')
+            self._section_label.setText('RÉSULTATS')
             players = [player for player in PlayersRegistry.get_all_players() if _matches(player, text)]
-            players.sort(key=lambda player: player.datetime.last_seen, reverse=True)
+            # BTX: Dangereux first, then Relou, then Ami, then the others (most recent first inside each group)
+            players.sort(key=lambda player: (not PlayersRegistry.is_player_connected(player), tag_rank(player.ip), -player.datetime.last_seen.timestamp()))
             players = players[:MAX_SEARCH_RESULTS]
-            if not players:
-                self._add_item('Aucun joueur trouvé dans cette session — Entrée pour chercher dans l\'historique', '#a293ad')
+            session_ips = {player.ip for player in players}
+            history_results = [r for r in search_players(text, limit=8, exclude_ips=session_ips) if not r.in_session and not set(r.ips) & session_ips]
+            if not players and not history_results:
+                self._add_item('Aucun joueur trouvé' + ('' if PlayerIndex.is_ready() else ' (historique en chargement…)'), '#a293ad')
         else:
             self._section_label.setText('DERNIERS ARRIVÉS')
             players = sorted(connected, key=lambda player: player.datetime.last_rejoin, reverse=True)[:MAX_RECENT_PLAYERS]
+            players.sort(key=lambda player: tag_rank(player.ip))  # stable: keeps the arrival order inside each tag
             if not players:
                 self._add_item('Aucun joueur connecté pour l\'instant', '#a293ad')
 
@@ -571,7 +584,24 @@ class BTXOverlay(QWidget):
             item = self._add_item(text, tag_color(player.ip) or '#efd7f3', tooltip=tooltip)
             item.setData(Qt.ItemDataRole.UserRole, {'ip': player.ip, 'port': port, 'names': list(player.usernames)})
 
+        if history_results:
+            header = self._add_item('— DANS L\'HISTORIQUE —', '#a293ad')
+            header.setFlags(Qt.ItemFlag.NoItemFlags)
+            for result in history_results:
+                label = result_text(result).replace('  ·  ', '   ', 1)
+                item = self._add_item(label, tag_color(result.ip) or '#c9b6d6', tooltip='IP : ' + ', '.join(result.ips) + '\nDouble-clic : fiche du joueur')
+                item.setData(Qt.ItemDataRole.UserRole, {'ip': result.ip, 'port': None, 'names': list(result.usernames)})
+
         self._fit_height()
+
+    def _on_index_updated(self) -> None:
+        if self.isVisible() and self._search.text().strip():
+            self.refresh()
+
+    def _open_card_for_item(self, item: QListWidgetItem) -> None:
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(data, dict):
+            open_player_card(None, data['ip'], data['names'], self.refresh)
 
     def _fit_height(self) -> None:
         """Grow or shrink the window with the number of rows (capped to the screen height)."""
@@ -623,6 +653,12 @@ class BTXOverlay(QWidget):
         return item
 
     def _search_in_history(self) -> None:
+        """Enter: open the card of the first result (or the history tab if nothing matches)."""
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            if isinstance(item.data(Qt.ItemDataRole.UserRole), dict):
+                self._open_card_for_item(item)
+                return
         self._open_history_search(self._search.text().strip())
 
     # --- drag to move -----------------------------------------------------

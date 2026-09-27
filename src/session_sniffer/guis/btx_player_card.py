@@ -9,6 +9,7 @@ Scans every saved session log for one IP address and shows, in a single window:
 Only one card is open at a time: opening another player replaces the current one.
 """
 
+import ipaddress
 import json
 import threading
 from collections.abc import Callable
@@ -17,10 +18,13 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QPoint, Qt, Signal
+from PySide6.QtCore import QObject, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
+    QInputDialog,
+    QMessageBox,
     QDialog,
     QFrame,
     QGridLayout,
@@ -38,7 +42,8 @@ from PySide6.QtWidgets import (
 
 from session_sniffer.constants.local import RESOURCES_DIR_PATH, SESSIONS_LOGGING_DIR_PATH
 from session_sniffer.constants.standard import LOCAL_TZ
-from session_sniffer.guis.btx_notes import TAGS, PlayerNotes, add_tag_menu, edit_player_note
+from session_sniffer.guis.btx_notes import TAGS, PlayerLinks, PlayerNotes, add_tag_menu, edit_player_note
+from session_sniffer.player.registry import PlayersRegistry
 
 MAX_ENCOUNTERS_SHOWN = 50
 _UNRESOLVED = {'', '...', 'N/A', 'None'}
@@ -97,6 +102,7 @@ class Encounter:
     end: datetime | None
     seconds: float
     usernames: list[str]
+    ip: str = ''
 
 
 @dataclass
@@ -106,7 +112,23 @@ class PlayerCardData:
     ip: str
     encounters: list[Encounter] = field(default_factory=list)
     usernames: list[str] = field(default_factory=list)
-    details: dict[str, object] = field(default_factory=dict)
+    ips: list[str] = field(default_factory=list)  # every IP linked to this player
+    details_by_ip: dict[str, dict[str, object]] = field(default_factory=dict)
+    # other IPs where one of the usernames was seen (possible new box / VPN): (ip, last seen, usernames)
+    suggestions: list[tuple[str, datetime | None, list[str]]] = field(default_factory=list)
+
+    @property
+    def latest_ip(self) -> str:
+        return self.encounters[0].ip if self.encounters and self.encounters[0].ip else self.ip
+
+    @property
+    def details(self) -> dict[str, object]:
+        return self.details_by_ip.get(self.latest_ip) or self.details_by_ip.get(self.ip) or {'IP Address': self.ip}
+
+    def ip_stats(self, ip: str) -> tuple[int, datetime | None]:
+        """(number of encounters, last seen) for one of the linked IPs."""
+        mine = [e for e in self.encounters if e.ip == ip]
+        return len(mine), max(((e.end or e.start) for e in mine), default=None)
 
     @property
     def country(self) -> str:
@@ -182,40 +204,58 @@ def _str_list(raw: object) -> list[str]:
 
 
 def collect_player_card(ip: str, folder: Path = SESSIONS_LOGGING_DIR_PATH) -> PlayerCardData:
-    """Scan every JSON session log under *folder* and gather the history of *ip*."""
-    card = PlayerCardData(ip=ip)
-    infos: list[tuple[datetime, dict]] = []
+    """Scan every JSON session log under *folder* and gather the history of *ip* and of its linked IPs."""
+    members = PlayerLinks.group_of(ip)
+    member_set = set(members)
+    card = PlayerCardData(ip=ip, ips=list(members))
+    infos: dict[str, list[tuple[datetime, dict]]] = {member: [] for member in members}
+    name_sightings: dict[str, dict[str, tuple[datetime, set[str]]]] = {}  # lower name -> ip -> (last seen, names)
 
     for json_file in folder.rglob('*.json'):
-        info = None
-        with suppress(OSError, ValueError, TypeError):
+        try:
             data = json.loads(json_file.read_text(encoding='utf-8', errors='replace'))
-            if isinstance(data, dict):
-                for section in ('connected', 'disconnected'):
-                    players = data.get(section)
-                    if isinstance(players, dict) and isinstance(players.get(ip), dict):
-                        info = players[ip]
-                        break
-        if info is None:
+        except (OSError, ValueError):
             continue
-
-        start = _parse_dt(info.get('First Seen'))
-        if start is None:
+        if not isinstance(data, dict):
             continue
-        end = _parse_dt(info.get('Last Seen'))
-        seconds = _parse_seconds(info.get('T. Session Time'))
-        if not seconds and end is not None:
-            seconds = max(0.0, (end - start).total_seconds())
-        card.encounters.append(Encounter(start=start, end=end, seconds=seconds, usernames=_str_list(info.get('Usernames'))))
-        infos.append((start, info))
+        seen_in_file: set[str] = set()
+        for section in ('connected', 'disconnected'):
+            players = data.get(section)
+            if not isinstance(players, dict):
+                continue
+            for player_ip, info in players.items():
+                if not isinstance(info, dict):
+                    continue
+                player_ip = str(player_ip)  # noqa: PLW2901
+                names = _str_list(info.get('Usernames'))
+                start = _parse_dt(info.get('First Seen'))
+                if start is None:
+                    continue
+                end = _parse_dt(info.get('Last Seen'))
+                if names:
+                    for name in names:
+                        per_ip = name_sightings.setdefault(name.lower(), {})
+                        last, known = per_ip.get(player_ip, (start, set()))
+                        per_ip[player_ip] = (max(last, end or start), known | set(names))
+                if player_ip not in member_set or player_ip in seen_in_file:
+                    continue
+                seen_in_file.add(player_ip)
+                seconds = _parse_seconds(info.get('T. Session Time'))
+                if not seconds and end is not None:
+                    seconds = max(0.0, (end - start).total_seconds())
+                card.encounters.append(Encounter(start=start, end=end, seconds=seconds, usernames=names, ip=player_ip))
+                infos[player_ip].append((start, info))
 
-    # lookup details: oldest first, so the most recent resolved value wins
-    for _start, info in sorted(infos, key=lambda pair: pair[0]):
-        for key in _DETAIL_KEYS:
-            value = info.get(key)
-            if _is_resolved(value):
-                card.details[key] = value
-    card.details.setdefault('IP Address', ip)
+    # lookup details per IP: oldest first, so the most recent resolved value wins
+    for member, member_infos in infos.items():
+        details: dict[str, object] = {}
+        for _start, info in sorted(member_infos, key=lambda pair: pair[0]):
+            for key in _DETAIL_KEYS:
+                value = info.get(key)
+                if _is_resolved(value):
+                    details[key] = value
+        details.setdefault('IP Address', member)
+        card.details_by_ip[member] = details
 
     card.encounters.sort(key=lambda e: e.start, reverse=True)
     recent_first: dict[str, None] = {}
@@ -223,7 +263,26 @@ def collect_player_card(ip: str, folder: Path = SESSIONS_LOGGING_DIR_PATH) -> Pl
         for name in encounter.usernames:
             recent_first.setdefault(name, None)
     card.usernames = list(recent_first)
+
+    # same username seen on other IPs -> suggest linking them
+    suggestions: dict[str, tuple[datetime, set[str]]] = {}
+    for name in card.usernames:
+        for other_ip, (last, names) in name_sightings.get(name.lower(), {}).items():
+            if other_ip in member_set:
+                continue
+            previous = suggestions.get(other_ip)
+            suggestions[other_ip] = (max(last, previous[0]) if previous else last, names | (previous[1] if previous else set()))
+    card.suggestions = sorted(((sip, last, sorted(names)) for sip, (last, names) in suggestions.items()), key=lambda s: s[1] or datetime.min.replace(tzinfo=LOCAL_TZ), reverse=True)[:10]
     return card
+
+
+def online_ip(ips: list[str]) -> str | None:
+    """The IP among *ips* that is connected in the current session, if any."""
+    for member in ips:
+        player = PlayersRegistry.get_player_by_ip(member)
+        if player is not None and PlayersRegistry.is_player_connected(player):
+            return member
+    return None
 
 
 # ---------- formatting ----------
@@ -370,12 +429,13 @@ class PlayerCardDialog(QDialog):
         root.addWidget(self._tabs, 1)
         self._tabs.addTab(self._build_summary_tab(), QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'player.svg')), 'Résumé')
         self._tabs.addTab(self._build_details_tab(), QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'globe.svg')), "Détails de l'IP")
+        self._tabs.addTab(self._build_ips_tab(), QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'link.svg')), 'Adresses IP')
 
         # buttons
         buttons = QHBoxLayout()
         copy_btn = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'copy.svg')), 'Copier')
         copy_menu = QMenu(copy_btn)
-        copy_menu.addAction("Copier l'IP", lambda: QGuiApplication.clipboard().setText(self._ip))
+        copy_menu.addAction("Copier l'IP", lambda: QGuiApplication.clipboard().setText(self._current_ip()))
         copy_menu.addAction('Copier le pseudo', lambda: QGuiApplication.clipboard().setText(', '.join(self._names)))
         copy_menu.addSeparator()
         copy_menu.addAction('Copier la fiche (résumé)', self._copy_summary)
@@ -397,6 +457,12 @@ class PlayerCardDialog(QDialog):
 
         self._loader = _Loader(self)
         self._loader.loaded.connect(self._apply)
+
+        # live "connected now" status of the linked IPs
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(3000)
+        self._status_timer.timeout.connect(self._refresh_status)
+        self._status_timer.start()
 
     # ----- tabs -----
 
@@ -427,13 +493,14 @@ class PlayerCardDialog(QDialog):
         encounters_label = QLabel('Dernières rencontres')
         encounters_label.setStyleSheet('font-weight: 600;')
         layout.addWidget(encounters_label)
-        self._table = _readonly_table(['Date', 'Durée', 'Pseudo'], page)
+        self._table = _readonly_table(['Date', 'Durée', 'Pseudo', 'IP'], page)
         self._table.setAlternatingRowColors(True)
         h_header = self._table.horizontalHeader()
         if h_header:
             h_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
             h_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
             h_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            h_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self._table, 1)
         return page
 
@@ -441,6 +508,15 @@ class PlayerCardDialog(QDialog):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setSpacing(8)
+
+        self._details_ip_row = QWidget()
+        ip_row = QHBoxLayout(self._details_ip_row)
+        ip_row.setContentsMargins(0, 0, 0, 0)
+        ip_row.addWidget(QLabel('IP :'))
+        self._details_ip = QComboBox()
+        self._details_ip.currentIndexChanged.connect(self._on_details_ip_changed)
+        ip_row.addWidget(self._details_ip, 1)
+        layout.addWidget(self._details_ip_row)
 
         self._details = _readonly_table(['Info', 'Valeur'], page)
         self._details.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -462,6 +538,47 @@ class PlayerCardDialog(QDialog):
         bottom.addWidget(hint, 1)
         bottom.addWidget(copy_all)
         layout.addLayout(bottom)
+        return page
+
+    def _build_ips_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(8)
+        info = QLabel(
+            "Si ce joueur change d'IP (nouvelle box, VPN…), relie ses IP : une seule fiche, "
+            'la même note et la même étiquette sur toutes ses IP, et tu vois sur laquelle il est connecté.',
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet('color: #b9a3c9;')
+        layout.addWidget(info)
+
+        self._ips = _readonly_table(['IP', 'Statut', 'Rencontres', 'Dernière vue'], page)
+        self._ips.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._ips.doubleClicked.connect(lambda index: self._show_ip_details(index.row()))
+        h_header = self._ips.horizontalHeader()
+        if h_header:
+            h_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            h_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            h_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            h_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self._ips, 1)
+
+        row = QHBoxLayout()
+        link_btn = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'link.svg')), 'Relier une autre IP…')
+        link_btn.clicked.connect(self._ask_link)
+        self._unlink_btn = QPushButton(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'remove.svg')), "Délier l'IP sélectionnée")
+        self._unlink_btn.clicked.connect(self._unlink_selected)
+        row.addWidget(link_btn)
+        row.addWidget(self._unlink_btn)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        self._suggestions = QLabel()
+        self._suggestions.setWordWrap(True)
+        self._suggestions.setTextFormat(Qt.TextFormat.RichText)
+        self._suggestions.linkActivated.connect(self._link_from_suggestion)
+        self._suggestions.setStyleSheet('padding: 8px; border: 1px dashed rgba(63, 240, 255, 0.45); border-radius: 6px;')
+        layout.addWidget(self._suggestions)
         return page
 
     # ----- public -----
@@ -507,6 +624,8 @@ class PlayerCardDialog(QDialog):
         self.setWindowTitle(f'Fiche joueur — {", ".join(self._names) or ip}')
         self._table.setRowCount(0)
         self._details.setRowCount(0)
+        self._ips.setRowCount(0)
+        self._suggestions.setText('')
         self._render_header()
         self._load()
 
@@ -555,15 +674,144 @@ class PlayerCardDialog(QDialog):
             self._table.setItem(row, 0, date_item)
             self._table.setItem(row, 1, duration_item)
             self._table.setItem(row, 2, names_item)
+            self._table.setItem(row, 3, QTableWidgetItem(encounter.ip))
         if not data.encounters:
             self._table.insertRow(0)
             self._table.setItem(0, 0, QTableWidgetItem('Aucune rencontre enregistrée pour ce joueur.'))
-            self._table.setSpan(0, 0, 1, 3)
+            self._table.setSpan(0, 0, 1, 4)
+        self._table.setColumnHidden(3, len(data.ips) < 2)  # noqa: PLR2004
         self._table.clearSelection()
         self._table.setCurrentCell(-1, -1)
 
-        self._fill_details(data.details)
+        # details: one entry per linked IP (connected one, else most recent, first)
+        current = online_ip(data.ips) or data.latest_ip
+        ordered = [current] + [member for member in data.ips if member != current]
+        self._details_ip.blockSignals(True)  # noqa: FBT003
+        self._details_ip.clear()
+        for member in ordered:
+            self._details_ip.addItem(member, member)
+        self._details_ip.blockSignals(False)  # noqa: FBT003
+        self._details_ip_row.setVisible(len(ordered) > 1)
+        self._fill_details(data.details_by_ip.get(current, {'IP Address': current}))
+
+        self._fill_ips()
         self._render_header()
+
+    def _on_details_ip_changed(self, _index: int) -> None:
+        member = self._details_ip.currentData()
+        if self._data is not None and member:
+            self._fill_details(self._data.details_by_ip.get(member, {'IP Address': member}))
+
+    def _current_ip(self) -> str:
+        """Connected IP if the player is online, else the most recent one."""
+        if self._data is None:
+            return self._ip
+        return online_ip(self._data.ips) or self._data.latest_ip
+
+    def _selected_details_ip(self) -> str:
+        return str(self._details_ip.currentData() or (self._data.latest_ip if self._data else self._ip))
+
+    def _show_ip_details(self, row: int) -> None:
+        item = self._ips.item(row, 0)
+        if item is None:
+            return
+        index = self._details_ip.findData(item.text())
+        if index >= 0:
+            self._details_ip.setCurrentIndex(index)
+        self._tabs.setCurrentIndex(1)
+
+    # ----- linked IPs -----
+
+    def _fill_ips(self) -> None:
+        data = self._data
+        if data is None:
+            return
+        self._tabs.setTabText(2, f'Adresses IP ({len(data.ips)})')
+        self._ips.setRowCount(0)
+        connected = online_ip(data.ips)
+        for member in data.ips:
+            row = self._ips.rowCount()
+            self._ips.insertRow(row)
+            count, last = data.ip_stats(member)
+            ip_item = QTableWidgetItem(member)
+            status = QTableWidgetItem('🟢 Connecté maintenant' if member == connected else ('Dernière IP connue' if member == data.latest_ip else '—'))
+            if member == connected:
+                status.setForeground(QColor('#39ff88'))
+            count_item = QTableWidgetItem(str(count))
+            count_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._ips.setItem(row, 0, ip_item)
+            self._ips.setItem(row, 1, status)
+            self._ips.setItem(row, 2, count_item)
+            self._ips.setItem(row, 3, QTableWidgetItem(format_date(last) if last else '—'))
+        self._unlink_btn.setEnabled(len(data.ips) > 1)
+
+        if data.suggestions:
+            links = []
+            for sip, last, names in data.suggestions[:5]:
+                when = format_relative(last) if last else ''
+                links.append(f'<a href="{sip}" style="color:#3ff0ff;">{sip}</a> ({_escape(", ".join(names[:2]))}{" · " + when if when else ""})')
+            self._suggestions.setText('💡 <b>Même pseudo vu sur d\'autres IP</b> — clique pour les relier :<br>' + '<br>'.join(links))
+            self._suggestions.setVisible(True)
+        else:
+            self._suggestions.setVisible(False)
+
+    def _refresh_status(self) -> None:
+        if self._data is None or not self.isVisible():
+            return
+        self._render_header()
+        connected = online_ip(self._data.ips)
+        for row in range(self._ips.rowCount()):
+            ip_item, status = self._ips.item(row, 0), self._ips.item(row, 1)
+            if ip_item is None or status is None:
+                continue
+            is_on = ip_item.text() == connected
+            status.setText('🟢 Connecté maintenant' if is_on else ('Dernière IP connue' if ip_item.text() == self._data.latest_ip else '—'))
+            status.setForeground(QColor('#39ff88') if is_on else self._ips.palette().text().color())
+
+    def _link(self, other_ip: str) -> None:
+        other_ip = other_ip.strip()
+        try:
+            ipaddress.ip_address(other_ip)
+        except ValueError:
+            QMessageBox.warning(self, 'Relier une IP', f'« {other_ip} » n\'est pas une adresse IP valide.')
+            return
+        if self._data is not None and other_ip in self._data.ips:
+            return
+        PlayerLinks.link(self._ip, other_ip)
+        self._changed()
+        self._load()
+        self._tabs.setCurrentIndex(2)
+
+    def _link_from_suggestion(self, href: str) -> None:
+        self._link(href)
+
+    def _ask_link(self) -> None:
+        choices = [f'{sip}   —   {", ".join(names[:2])}' for sip, _last, names in (self._data.suggestions if self._data else [])]
+        text, ok = QInputDialog.getItem(
+            self,
+            'Relier une IP',
+            "IP à relier à ce joueur (tape-la ou choisis une IP où son pseudo a été vu) :",
+            choices,
+            0,
+            True,  # noqa: FBT003 - editable
+        )
+        if ok and text.strip():
+            self._link(text.split()[0])
+
+    def _unlink_selected(self) -> None:
+        row = self._ips.currentRow()
+        item = self._ips.item(row, 0) if row >= 0 else None
+        if item is None:
+            QMessageBox.information(self, 'Délier une IP', 'Choisis une IP dans la liste.')
+            return
+        target = item.text()
+        PlayerLinks.unlink(target)
+        if target == self._ip and self._data is not None:
+            remaining = [member for member in self._data.ips if member != target]
+            if remaining:
+                self._ip = remaining[0]
+        self._changed()
+        self._load()
 
     def _fill_details(self, details: dict[str, object]) -> None:
         table = self._details
@@ -632,8 +880,9 @@ class PlayerCardDialog(QDialog):
         menu.exec(self._details.viewport().mapToGlobal(pos))
 
     def _copy_details(self) -> None:
-        details = self._data.details if self._data is not None else {'IP Address': self._ip}
-        QGuiApplication.clipboard().setText(ip_details_text(self._ip, self._names, details))
+        member = self._selected_details_ip()
+        details = self._data.details_by_ip.get(member, {'IP Address': member}) if self._data is not None else {'IP Address': self._ip}
+        QGuiApplication.clipboard().setText(ip_details_text(member, self._names, details))
 
     # ----- header / note / tag -----
 
@@ -648,11 +897,20 @@ class PlayerCardDialog(QDialog):
 
         parts = [f'IP : {self._ip}']
         if self._data is not None:
-            place = ', '.join(p for p in (self._data.city, self._data.country) if p)
+            connected = online_ip(self._data.ips)
+            if connected:
+                parts = [f'🟢 Connecté maintenant sur {connected}']
+            else:
+                parts = [f'Hors ligne · dernière IP : {self._data.latest_ip}']
+            if len(self._data.ips) > 1:
+                parts.append(f'{len(self._data.ips)} IP reliées')
+            shown = self._data.details_by_ip.get(connected or self._data.latest_ip, {})
+            place = ', '.join(p for p in (_text(shown.get('City')), _text(shown.get('Country'))) if p)
             if place:
                 parts.append(f'Lieu (approx.) : {place}')
-            if self._data.isp:
-                parts.append(f'FAI : {self._data.isp}')
+            isp = _text(shown.get('ASN / ISP')) or _text(shown.get('ISP'))
+            if isp:
+                parts.append(f'FAI : {isp}')
             if len(self._data.usernames) > 1:
                 parts.append(f'{len(self._data.usernames)} pseudos connus')
         self._subtitle.setText('   •   '.join(parts))

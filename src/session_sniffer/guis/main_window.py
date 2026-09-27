@@ -55,6 +55,8 @@ from session_sniffer.settings import Settings
 from session_sniffer.guis.player_leaderboard import PlayerLeaderboardWindow
 from session_sniffer.guis.btx_overlay import OverlayController
 from session_sniffer.guis.btx_extras_menu import add_backup_menu, add_theme_menu
+from session_sniffer.guis.btx_player_card import open_player_card
+from session_sniffer.guis.btx_search import GlobalSearchDialog, install_global_search
 from session_sniffer.guis.btx_whats_new import WhatsNew
 
 if TYPE_CHECKING:
@@ -215,6 +217,14 @@ class MainWindow(LookyMixin, GameMixin, StatsMixin, FilesMixin, QMainWindow):
             message = 'Failed to create Tools menu'
             raise RuntimeError(message)
         tools_menu.setToolTipsVisible(True)
+
+        search_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'search.svg')), 'Rechercher un joueur…', self)
+        search_action.setShortcut('Ctrl+F')
+        search_action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)  # the real Ctrl+F is installed on the window
+        search_action.setToolTip('Chercher un joueur par pseudo, IP, pays, note ou étiquette (session + historique)')
+        search_action.triggered.connect(lambda: GlobalSearchDialog.open(self, self._open_card_from_search))
+        tools_menu.addAction(search_action)
+        tools_menu.addSeparator()
 
         detections_manager_action = QAction(QIcon(str(RESOURCES_DIR_PATH / 'icons' / 'shield.svg')), 'Gestionnaire de détections', self)
         detections_manager_action.setToolTip('Configurer les détections, les notifications et les règles de protection')
@@ -517,6 +527,9 @@ class MainWindow(LookyMixin, GameMixin, StatsMixin, FilesMixin, QMainWindow):
 
         # BTX: in-game mini window + global hotkey
         self._overlay_controller = OverlayController(self, self.open_history_search)
+        # BTX: Ctrl+F = search any player (session, history, notes) and open their card
+        self._open_card_from_search = lambda ip, names: open_player_card(self, ip, names)
+        install_global_search(self, self._open_card_from_search)
         # BTX: after an update, show the release notes of the new version once
         QTimer.singleShot(2500, self._whats_new.maybe_show_after_update)
 
